@@ -1,0 +1,23 @@
+{
+  "ai-native-auto-sync": {
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/post_tool_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/stop_gate_hook.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
