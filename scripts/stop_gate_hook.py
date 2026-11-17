@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,10 +9,13 @@ from verify_architecture import verify_workspace
 
 
 def split_semantic_and_auto(text: str) -> tuple[str, str]:
-    if START_MARKER not in text or END_MARKER not in text:
+    start_m = re.search(rf"^[ \t]*{re.escape(START_MARKER)}[ \t]*$", text, re.M)
+    end_m = re.search(rf"^[ \t]*{re.escape(END_MARKER)}[ \t]*$", text, re.M)
+    if not start_m or not end_m or end_m.start() <= start_m.end():
         return text.strip(), ""
-    before, rest = text.split(START_MARKER, 1)
-    auto_body, after = rest.split(END_MARKER, 1)
+    before = text[:start_m.start()]
+    auto_body = text[start_m.end():end_m.start()]
+    after = text[end_m.end():]
     return (before + "\n" + after).strip(), auto_body.strip()
 
 

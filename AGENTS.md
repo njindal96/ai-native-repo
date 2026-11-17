@@ -22,7 +22,7 @@
 _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit inside this block._
 
 #### Scoped `AGENTS.md` Hierarchy
-- `AGENTS.md` — Scope: Repository Root (34 lines)
+- `AGENTS.md` — Scope: Repository Root (35 lines)
 - `rules/AGENTS.md` — Scope: `rules/` (13 lines)
 
 #### Codebase Module & Dependency Summary
@@ -31,4 +31,5 @@ _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit
 - `scripts/stop_gate_hook.py` — Functions: `split_semantic_and_auto()`, `check_semantic_drift()`, `format_response()`, `main()`
 - `scripts/sync_context.py` — Functions: `format_annotation()`, `is_internal_module()`, `parse_adr_frontmatter()`, `load_all_adrs()`, `inspect_python_file()`, `inspect_ts_file()`, `build_root_block()`, `build_directory_block()`, `sync_agents_file()`, `sync_workspace()`, `main()` | Constants: `START_MARKER`, `END_MARKER`, `IGNORE_DIRS`
 - `scripts/verify_architecture.py` — Functions: `extract_imports()`, `is_internal_module()`, `check_llm_smells()`, `matches_prefix()`, `verify_workspace()`, `main()` | Constants: `IGNORE_DIRS`
+- `tests/test_ai_native_engine.py` — Classes: `TestAiNativeEngine` | Constants: `REPO_ROOT`, `SCRIPTS_DIR`
 <!-- AUTO-GENERATED:END -->

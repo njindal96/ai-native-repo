@@ -12,6 +12,7 @@ Scaffolds (non-destructively):
 """
 import argparse
 import json
+import re
 import shutil
 import stat
 import subprocess
@@ -31,7 +32,9 @@ def detect_code_layers(repo_root: Path) -> list[dict]:
     layers = []
     candidates = []
     for child in sorted(repo_root.iterdir()):
-        if not child.is_dir() or child.name in IGNORE_DIRS or child.name in {"scripts", "tests", "docs", ".github"}:
+        if not child.is_dir() or child.name in IGNORE_DIRS or child.name in {
+            "scripts", "tests", "docs", ".github", "skills", "rules", "assets"
+        }:
             continue
         subdirs = [
             d for d in sorted(child.iterdir())
@@ -90,7 +93,9 @@ def ensure_markers_in_agents_md(agents_path: Path, title: str, is_root: bool) ->
         return True
 
     text = agents_path.read_text(encoding="utf-8")
-    if START_MARKER not in text or END_MARKER not in text:
+    start_m = re.search(rf"^[ \t]*{re.escape(START_MARKER)}[ \t]*$", text, re.M)
+    end_m = re.search(rf"^[ \t]*{re.escape(END_MARKER)}[ \t]*$", text, re.M)
+    if not start_m or not end_m:
         text = text.rstrip() + f"\n\n{START_MARKER}\n{END_MARKER}\n"
         agents_path.write_text(text, encoding="utf-8")
         return True
