@@ -85,6 +85,14 @@ def detect_test_command(repo_root: Path) -> str:
         return "python3 -m unittest discover -s tests -p 'test_*.py'"
     if (repo_root / "package.json").is_file():
         return "npm test --if-present"
+    if (repo_root / "go.mod").is_file():
+        return "go test ./..."
+    if (repo_root / "Cargo.toml").is_file():
+        return "cargo test"
+    if (repo_root / "pom.xml").is_file():
+        return "mvn test"
+    if (repo_root / "gradlew").is_file():
+        return "./gradlew test"
     return ""
 
 
@@ -98,6 +106,7 @@ def ensure_markers_in_agents_md(agents_path: Path, title: str, is_root: bool) ->
                 "## 1. Verification & Operational Tiers\n"
                 "- **Verify Architecture & Tests:** `python3 scripts/verify_architecture.py`\n"
                 "- **Sync Contracts & ADRs:** `python3 scripts/sync_context.py`\n"
+                "- **Single-Hop Context Capsule (Why, Callers & Tests):** `python3 scripts/sync_context.py --for <file>`\n"
                 "- **Always:** Read the target directory's `AGENTS.md` and governing `docs/adr/*.md` first; run `python3 scripts/verify_architecture.py` after edits.\n"
                 "- **Ask First:** Changing database schemas, public contracts, or adding external dependencies.\n"
                 "- **Never:** Cross forbidden layer imports in `.ai-native.json` or hand-edit inside `<!-- AUTO-GENERATED -->` blocks.\n\n"
@@ -307,22 +316,54 @@ def merge_hooks_into_settings(settings_path: Path, plugin_dir: Optional[Path] = 
     return changed
 
 
+def _ensure_adr_rationale_sections(adr_dir: Path, repo_root: Path) -> list[str]:
+    actions: list[str] = []
+    why_pat = re.compile(r"^##+\s+.*\b(context|why|rationale|background)\b", re.I | re.M)
+    guard_pat = re.compile(r"^##+\s+.*\b(decision|invariants?|anti-patterns?|do\s+not|guardrails?)\b", re.I | re.M)
+    for adr_path in sorted(adr_dir.glob("*.md")):
+        if adr_path.name.lower() == "readme.md":
+            continue
+        raw = adr_path.read_text(encoding="utf-8")
+        norm = raw.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+        body = norm
+        open_m = re.match(r"^---[ \t]*\n", norm)
+        if open_m:
+            rest = norm[open_m.end():]
+            close_m = re.search(r"(?:^|\n)---[ \t]*(?:\n|$)", rest)
+            if close_m:
+                body = rest[close_m.end():]
+        additions: list[str] = []
+        if not why_pat.search(body):
+            additions.append("## Context & Why\nDescribe why this architectural constraint or design exists.")
+        if not guard_pat.search(body):
+            additions.append(
+                "## Decision & Invariants\nDescribe non-negotiable final-state invariants and anti-patterns (`Do Not Do`)."
+            )
+        if additions:
+            updated = raw.rstrip() + "\n\n" + "\n\n".join(additions) + "\n"
+            adr_path.write_text(updated, encoding="utf-8")
+            actions.append(f"Upgraded {adr_path.relative_to(repo_root).as_posix()} rationale sections")
+    return actions
+
+
 def bootstrap_repository(repo_root: Path) -> list[str]:
     actions = []
     repo_root = repo_root.resolve()
 
-    # 1. Copy sync_context.py and verify_architecture.py into repo/scripts/
+    # 1. Copy/upgrade sync_context.py and verify_architecture.py into repo/scripts/
     target_scripts = repo_root / "scripts"
     target_scripts.mkdir(parents=True, exist_ok=True)
     for script_name in ("sync_context.py", "verify_architecture.py"):
         src = PLUGIN_SCRIPTS_DIR / script_name
         dst = target_scripts / script_name
         if src.resolve() != dst.resolve():
-            shutil.copy2(src, dst)
-            make_executable(dst)
-            actions.append(f"Installed scripts/{script_name}")
+            existed = dst.exists()
+            if not existed or src.read_bytes() != dst.read_bytes():
+                shutil.copy2(src, dst)
+                make_executable(dst)
+                actions.append(f"{'Updated' if existed else 'Installed'} scripts/{script_name}")
 
-    # 2. Create .ai-native.json if missing
+    # 2. Create or non-destructively upgrade .ai-native.json
     config_path = repo_root / ".ai-native.json"
     layers = detect_code_layers(repo_root)
     if not config_path.exists():
@@ -331,6 +372,7 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             "context_budget": {"max_lines": 200, "max_bytes": 20000},
             "test_command": detect_test_command(repo_root),
             "enforce_contract_compatibility": True,
+            "enforce_pre_edit_context": True,
             "mutation_testing": True,
             "max_mutants": 25,
             "layers": layers,
@@ -341,6 +383,16 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
         try:
             cfg = json.loads(config_path.read_text(encoding="utf-8"))
             layers = cfg.get("layers", layers)
+            changed_cfg = False
+            if "enforce_pre_edit_context" not in cfg:
+                cfg["enforce_pre_edit_context"] = True
+                changed_cfg = True
+            if "max_mutants" not in cfg:
+                cfg["max_mutants"] = 25
+                changed_cfg = True
+            if changed_cfg:
+                config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+                actions.append("Upgraded .ai-native.json defaults")
         except Exception:
             pass
 
@@ -385,6 +437,8 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             encoding="utf-8",
         )
         actions.append("Created docs/adr/001-ai-native-architecture.md")
+    else:
+        actions.extend(_ensure_adr_rationale_sections(adr_dir, repo_root))
 
     # 6. Install .githooks/pre-commit & pre-push while preserving pre-existing hooks
     actions.extend(_install_git_hooks_non_destructive(repo_root))

@@ -18,6 +18,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
 import tempfile
 import time
@@ -208,10 +209,81 @@ def _extract_used_refs(node: ast.AST) -> set[str]:
     return refs
 
 
+def _is_polyglot_test_file(rel: str) -> bool:
+    norm = rel.lstrip("./")
+    name = Path(norm).name
+    return (
+        norm.startswith("tests/")
+        or norm.startswith("test/")
+        or "/__tests__/" in f"/{norm}"
+        or name.endswith((
+            ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
+            ".test.js", ".spec.js", ".test.jsx", ".spec.jsx",
+            "_test.go", "_test.rs", "Test.java", "Tests.java",
+        ))
+    )
+
+
+def _extract_polyglot_import_specs(raw_text: str, suffix: str) -> list[str]:
+    """Extract import/require specifiers from comment-stripped non-Python code while preserving string quotes."""
+    # Remove /* ... */ and // comments without erasing quoted module strings
+    out: list[str] = []
+    i, n = 0, len(raw_text)
+    while i < n:
+        ch = raw_text[i]
+        nxt = raw_text[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "*":
+            out.append(" ")
+            i += 2
+            while i < n and not (raw_text[i] == "*" and i + 1 < n and raw_text[i + 1] == "/"):
+                if raw_text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            continue
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < n and raw_text[i] != "\n":
+                i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            quote = ch
+            out.append(quote)
+            i += 1
+            while i < n:
+                c = raw_text[i]
+                out.append(c)
+                if c == "\\" and i + 1 < n:
+                    out.append(raw_text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    cleaned = "".join(out)
+    specs: list[str] = []
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs"}:
+        for pat in (r"""\bfrom\s+["']([^"']+)["']""", r"""\bimport\s+["']([^"']+)["']""", r"""\brequire\(\s*["']([^"']+)["']\s*\)"""):
+            specs.extend(re.findall(pat, cleaned))
+    elif suffix == ".go":
+        for blk in re.findall(r"""import\s*\(([^)]*)\)""", cleaned, re.S):
+            specs.extend(re.findall(r'"([^"]+)"', blk))
+        specs.extend(re.findall(r'^import\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"', cleaned, re.M))
+    elif suffix == ".rs":
+        specs.extend(re.findall(r"^\s*(?:pub\s+)?use\s+([A-Za-z0-9_:]+)", cleaned, re.M))
+    elif suffix == ".java":
+        specs.extend(re.findall(r"^\s*import\s+(?:static\s+)?([A-Za-z0-9_.]+)", cleaned, re.M))
+    return specs
+
+
 def build_reverse_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """
-    Build repo-wide reverse maps for Python modules:
-    - used_by[target_rel]: sorted non-test source files importing target_rel
+    Build repo-wide reverse maps for Python and Tier-2 polyglot modules:
+    - used_by[target_rel]: sorted non-test source files importing/referencing target_rel
     - tested_by[target_rel]: sorted `test_file::test_fn` (or `test_file`) referencing target_rel
     """
     mod_to_rel: dict[str, str] = {}
@@ -288,6 +360,60 @@ def build_reverse_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str
             for t_rel in target_refs:
                 if t_rel not in matched_targets:
                     tested_by_sets.setdefault(t_rel, set()).add(rel)
+
+    # Polyglot reverse indexing (TS/JS/Go/Rust/Java)
+    poly_files = _iter_polyglot_files(repo_root)
+    if poly_files:
+        poly_meta: dict[str, tuple[str, str, set[str]]] = {}
+        for tf in poly_files:
+            t_info = inspect_polyglot_file(tf, repo_root)
+            t_rel = t_info["rel_path"]
+            t_no_ext = posixpath.splitext(t_rel)[0]
+            t_stem = Path(t_no_ext).name
+            poly_meta[t_rel] = (t_no_ext, t_stem, set(t_info.get("exports", [])))
+
+        for tf in poly_files:
+            rel = tf.relative_to(repo_root).as_posix()
+            try:
+                raw = tf.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            specs = _extract_polyglot_import_specs(raw, tf.suffix.lower())
+            code_idents = set(re.findall(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b", strip_comments_and_strings(raw)))
+            src_dir = posixpath.dirname(rel)
+            resolved_specs: set[str] = set()
+            for s in specs:
+                if s.startswith("."):
+                    norm_s = posixpath.normpath(posixpath.join(src_dir, s) if src_dir else s)
+                    resolved_specs.add(posixpath.splitext(norm_s)[0])
+                    if norm_s.endswith("/index"):
+                        resolved_specs.add(norm_s[:-6])
+
+            is_test = _is_polyglot_test_file(rel)
+            for t_rel, (t_no_ext, t_stem, exp_syms) in poly_meta.items():
+                if t_rel == rel:
+                    continue
+                t_dir_if_index = t_no_ext[:-6] if t_no_ext.endswith("/index") else ""
+                matched = (t_no_ext in resolved_specs) or (bool(t_dir_if_index) and t_dir_if_index in resolved_specs)
+                if not matched:
+                    for s in specs:
+                        if s.endswith(t_no_ext) or (
+                            exp_syms
+                            and (exp_syms & code_idents)
+                            and (
+                                s == t_stem
+                                or s.endswith("/" + t_stem)
+                                or s.endswith("." + t_stem)
+                                or s.endswith("::" + t_stem)
+                            )
+                        ):
+                            matched = True
+                            break
+                if matched:
+                    if is_test:
+                        tested_by_sets.setdefault(t_rel, set()).add(rel)
+                    else:
+                        used_by_sets.setdefault(t_rel, set()).add(rel)
 
     used_by = {k: sorted(v) for k, v in used_by_sets.items()}
     tested_by = {k: sorted(v) for k, v in tested_by_sets.items()}
@@ -472,7 +598,10 @@ def build_context_capsule(repo_root: Path, target_file: str, mark_ledger: bool =
         for fn in info.get("functions", []):
             lines.append(f"- **Function:** `{fn}`")
     elif target_path.is_file() and target_path.suffix.lower() in POLYGLOT_EXTENSIONS:
+        used_by, tested_by = build_reverse_index(repo_root)
         t_info = inspect_polyglot_file(target_path, repo_root)
+        lines.append("- **Used By (Blast Radius):** " + (", ".join(f"`{u}`" for u in used_by.get(target_rel, [])) or "_None_"))
+        lines.append("- **Tested By (Verify With):** " + (", ".join(f"`{t}`" for t in tested_by.get(target_rel, [])) or "_None_"))
         lines.append("- **Exports:** " + (", ".join(f"`{e}`" for e in t_info.get("exports", [])) or "_None_"))
     elif not target_path.exists():
         lines.append(f"- _Target file `{target_rel}` does not exist on disk yet._")
@@ -843,7 +972,12 @@ def build_directory_block(
 
     for tf in poly_files:
         t_info = inspect_polyglot_file(tf, repo_root)
-        lines.append(f"#### `{t_info['rel_path']}`")
+        rel_t = t_info["rel_path"]
+        lines.append(f"#### `{rel_t}`")
+        if used_by.get(rel_t):
+            lines.append("- **Used By:** " + _format_capped_refs(used_by[rel_t]))
+        if tested_by.get(rel_t):
+            lines.append("- **Tested By:** " + _format_capped_refs(tested_by[rel_t]))
         if t_info["exports"]:
             lines.append("- **Exports:** " + ", ".join(f"`{e}`" for e in t_info["exports"]))
         lines.append("")

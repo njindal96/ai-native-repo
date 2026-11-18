@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,12 +47,62 @@ SHELL_TOOLS = {
 TRIVIAL_SHELL_PREFIXES = ("git status", "git diff", "git log", "pwd", "ls", "echo ", "true")
 POLL_SHELL_PREFIXES = (
     "gh run",
+    "gh pr checks",
+    "gh workflow",
     "curl ",
+    "wget ",
     "kubectl get",
+    "kubectl logs",
     "docker ps",
-    "python -m pipeline",
-    "python3 -m pipeline",
+    "docker compose ps",
+    "systemctl status",
+    "pm2 status",
 )
+
+
+def _get_poll_prefixes(ws_path: Path) -> tuple[str, ...]:
+    prefixes = list(POLL_SHELL_PREFIXES)
+    cfg_path = ws_path / ".ai-native.json"
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            custom = cfg.get("poll_command_prefixes")
+            if isinstance(custom, list):
+                for item in custom:
+                    if isinstance(item, str) and item.strip():
+                        prefixes.append(item.strip().lower())
+        except Exception:
+            pass
+    return tuple(prefixes)
+
+
+def auto_upgrade_repo_scripts(ws_path: Path) -> list[str]:
+    """
+    Propagate updated plugin scripts into onboarded repositories when the global
+    ai-native-repo plugin is newer than the workspace's copies.
+    """
+    upgraded: list[str] = []
+    if not (ws_path / ".ai-native.json").is_file() or not (ws_path / "scripts").is_dir():
+        return upgraded
+    plugin_scripts = Path(_SCRIPT_DIR).resolve()
+    ws_res = ws_path.resolve()
+    if ws_res == plugin_scripts.parent:
+        return upgraded
+
+    for script_name in ("sync_context.py", "verify_architecture.py"):
+        src = plugin_scripts / script_name
+        dst = ws_res / "scripts" / script_name
+        if not src.is_file() or not dst.is_file():
+            continue
+        try:
+            if src.resolve() != dst.resolve() and src.read_bytes() != dst.read_bytes():
+                shutil.copy2(src, dst)
+                mode = dst.stat().st_mode
+                dst.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                upgraded.append(f"scripts/{script_name}")
+        except OSError:
+            pass
+    return upgraded
 
 
 def extract_workspaces(payload: object) -> list[str]:
@@ -254,7 +306,7 @@ def record_tool_telemetry(ws_path: Path, payload: object) -> None:
 
         norm_cmd = normalize_shell_command(cmd)
         if norm_cmd:
-            if norm_cmd.lower().startswith(POLL_SHELL_PREFIXES):
+            if norm_cmd.lower().startswith(_get_poll_prefixes(ws_path)):
                 state["poll_commands"][norm_cmd] = int(state["poll_commands"].get(norm_cmd, 0)) + 1
 
             history: list[str] = state["shell_history"]
@@ -373,6 +425,7 @@ def main():
         if not ws_path.is_dir():
             continue
         record_tool_telemetry(ws_path, payload)
+        auto_upgrade_repo_scripts(ws_path)
         if (ws_path / "AGENTS.md").exists():
             try:
                 sync_workspace(ws_path)

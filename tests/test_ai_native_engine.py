@@ -18,7 +18,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import post_tool_hook  # noqa: E402
 import pre_tool_hook  # noqa: E402
 import stop_gate_hook  # noqa: E402
-from bootstrap_repo import bootstrap_repository, merge_hooks_into_settings  # noqa: E402
+from bootstrap_repo import bootstrap_repository, detect_test_command, merge_hooks_into_settings  # noqa: E402
 from pre_tool_hook import extract_command, validate_shell_command  # noqa: E402
 from stop_gate_hook import check_semantic_drift, split_semantic_and_auto  # noqa: E402
 from sync_context import (  # noqa: E402
@@ -1051,6 +1051,102 @@ class TestAiNativeEngine(unittest.TestCase):
                 _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": False}),
                 {},
             )
+
+    def test_scalable_multi_repo_auto_upgrade_and_polyglot_reverse_index(self):
+        # 1. Auto-upgrade outdated scripts on PostToolUse + non-destructive .ai-native.json & ADR backfill
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            (tmp_path / "scripts").mkdir()
+            (tmp_path / "scripts" / "sync_context.py").write_text("# stale v2\n", encoding="utf-8")
+            (tmp_path / "scripts" / "verify_architecture.py").write_text("# stale v2\n", encoding="utf-8")
+            (tmp_path / ".ai-native.json").write_text(
+                json.dumps({
+                    "version": "3.0",
+                    "test_command": "python3 -m unittest discover -s tests -p 'test_*.py'",
+                    "layers": [{"path": "app/domain"}, {"path": "app/services"}],
+                }),
+                encoding="utf-8",
+            )
+            (tmp_path / "AGENTS.md").write_text(f"# Root\n\n{START_MARKER}\n{END_MARKER}\n", encoding="utf-8")
+            (tmp_path / "docs" / "adr").mkdir(parents=True)
+            (tmp_path / "docs" / "adr" / "001-legacy.md").write_text(
+                "---\nid: ADR-001\ntitle: Legacy ADR\napplies_to: *\nsummary: Legacy.\n---\n\n# Legacy\nNotes.\n",
+                encoding="utf-8",
+            )
+
+            _run_hook_inproc(post_tool_hook, {"cwd": str(tmp_path)})
+            self.assertEqual(
+                (tmp_path / "scripts" / "sync_context.py").read_bytes(),
+                (SCRIPTS_DIR / "sync_context.py").read_bytes(),
+            )
+            self.assertEqual(
+                (tmp_path / "scripts" / "verify_architecture.py").read_bytes(),
+                (SCRIPTS_DIR / "verify_architecture.py").read_bytes(),
+            )
+
+            actions = bootstrap_repository(tmp_path)
+            self.assertIn("Upgraded .ai-native.json defaults", actions)
+            self.assertTrue(any("001-legacy.md" in a for a in actions))
+            upgraded_cfg = json.loads((tmp_path / ".ai-native.json").read_text(encoding="utf-8"))
+            self.assertTrue(upgraded_cfg["enforce_pre_edit_context"])
+            self.assertEqual(upgraded_cfg["max_mutants"], 25)
+            self.assertEqual(check_adr_completeness(tmp_path), [])
+
+        # 2. Polyglot reverse index (Used By & Tested By) + multi-stack test detection
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            (tmp_path / "package.json").write_text('{"name": "demo"}\n', encoding="utf-8")
+            (tmp_path / "web" / "domain").mkdir(parents=True)
+            (tmp_path / "web" / "services").mkdir(parents=True)
+            (tmp_path / "web" / "domain" / "order.ts").write_text(
+                "export interface Order { id: string; }\n",
+                encoding="utf-8",
+            )
+            (tmp_path / "web" / "services" / "checkout.ts").write_text(
+                'import { Order } from "../domain/order";\nexport function submitOrder(o: Order) { return o.id; }\n',
+                encoding="utf-8",
+            )
+            (tmp_path / "web" / "services" / "checkout.test.ts").write_text(
+                'import { submitOrder } from "./checkout";\nsubmitOrder({ id: "1" });\n',
+                encoding="utf-8",
+            )
+            bootstrap_repository(tmp_path)
+
+            domain_agents = (tmp_path / "web" / "domain" / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("- **Used By:** `web/services/checkout.ts`", domain_agents)
+            svc_agents = (tmp_path / "web" / "services" / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("- **Tested By:** `web/services/checkout.test.ts`", svc_agents)
+
+            ts_capsule = build_context_capsule(tmp_path, "web/domain/order.ts", mark_ledger=False)
+            self.assertIn("- **Used By (Blast Radius):** `web/services/checkout.ts`", ts_capsule)
+
+            go_dir = tmp_path / "go_pkg"
+            go_dir.mkdir()
+            (go_dir / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+            self.assertEqual(detect_test_command(go_dir), "go test ./...")
+            rs_dir = tmp_path / "rs_pkg"
+            rs_dir.mkdir()
+            (rs_dir / "Cargo.toml").write_text("[package]\nname='demo'\n", encoding="utf-8")
+            self.assertEqual(detect_test_command(rs_dir), "cargo test")
+
+        # 3. Repo-configurable custom poll_command_prefixes in .ai-native.json (stack-agnostic)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / ".ai-native.json").write_text(
+                json.dumps({"poll_command_prefixes": ["my-custom-job status"]}),
+                encoding="utf-8",
+            )
+            for _ in range(3):
+                _run_hook_inproc(post_tool_hook, {
+                    "cwd": str(tmp_path),
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "my-custom-job status --all"}},
+                })
+            res = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
+            self.assertEqual(res["decision"], "continue")
+            self.assertIn("Automation Candidate", res["reason"])
 
 
 if __name__ == "__main__":
