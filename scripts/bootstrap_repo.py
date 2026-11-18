@@ -265,7 +265,7 @@ def merge_hooks_into_settings(settings_path: Path, plugin_dir: Optional[Path] = 
                 {
                     "type": "command",
                     "command": f"python3 {p_dir / 'scripts' / 'pre_tool_hook.py'}",
-                    "timeout": 15,
+                    "timeout": 120,
                 }
             ],
         },
@@ -275,14 +275,14 @@ def merge_hooks_into_settings(settings_path: Path, plugin_dir: Optional[Path] = 
                 {
                     "type": "command",
                     "command": f"python3 {p_dir / 'scripts' / 'post_tool_hook.py'}",
-                    "timeout": 10,
+                    "timeout": 15,
                 }
             ],
         },
         "Stop": {
             "type": "command",
             "command": f"python3 {p_dir / 'scripts' / 'stop_gate_hook.py'}",
-            "timeout": 15,
+            "timeout": 120,
         },
     }
 

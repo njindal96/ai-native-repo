@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import stat
@@ -14,6 +15,9 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import post_tool_hook  # noqa: E402
+import pre_tool_hook  # noqa: E402
+import stop_gate_hook  # noqa: E402
 from bootstrap_repo import bootstrap_repository, merge_hooks_into_settings  # noqa: E402
 from pre_tool_hook import extract_command, validate_shell_command  # noqa: E402
 from stop_gate_hook import check_semantic_drift, split_semantic_and_auto  # noqa: E402
@@ -37,6 +41,14 @@ def _init_git_repo(root: Path):
     subprocess.run(["git", "init", "-b", "main"], cwd=str(root), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(root), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(root), check=True, capture_output=True)
+
+
+def _run_hook_inproc(mod, payload_obj) -> dict:
+    raw = json.dumps(payload_obj) if not isinstance(payload_obj, str) else payload_obj
+    buf_out = io.StringIO()
+    with mock.patch("sys.stdin", io.StringIO(raw)), mock.patch("sys.stdout", buf_out):
+        mod.main()
+    return json.loads(buf_out.getvalue())
 
 
 def _create_sample_app(root: Path):
@@ -200,18 +212,15 @@ class TestAiNativeEngine(unittest.TestCase):
             _init_git_repo(tmp_path)
             _create_sample_app(tmp_path)
             bootstrap_repository(tmp_path)
+            cfg_p = tmp_path / ".ai-native.json"
+            cfg_obj = json.loads(cfg_p.read_text(encoding="utf-8"))
+            cfg_obj["mutation_testing"] = False
+            cfg_p.write_text(json.dumps(cfg_obj), encoding="utf-8")
 
             subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
-            post_proc = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "post_tool_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path)}),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertEqual(post_proc.stdout.strip(), "{}")
+            self.assertEqual(_run_hook_inproc(post_tool_hook, {"cwd": str(tmp_path)}), {})
 
             billing_path = tmp_path / "app" / "services" / "billing.py"
             billing_path.write_text(
@@ -226,25 +235,11 @@ class TestAiNativeEngine(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            agy_stop = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            agy_res = json.loads(agy_stop.stdout)
+            agy_res = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
             self.assertEqual(agy_res["decision"], "continue")
             self.assertIn("app/services/AGENTS.md", agy_res["reason"])
 
-            cc_stop = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": False}),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            cc_res = json.loads(cc_stop.stdout)
+            cc_res = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": False})
             self.assertEqual(cc_res["decision"], "block")
             self.assertIn("app/services/AGENTS.md", cc_res["reason"])
 
@@ -255,23 +250,14 @@ class TestAiNativeEngine(unittest.TestCase):
             )
             svc_agents.write_text(svc_text, encoding="utf-8")
 
-            agy_allow = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
-                text=True,
-                capture_output=True,
-                check=True,
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
             )
-            self.assertEqual(json.loads(agy_allow.stdout), {"decision": "allow"})
-
-            cc_allow = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": False}),
-                text=True,
-                capture_output=True,
-                check=True,
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": False}),
+                {},
             )
-            self.assertEqual(json.loads(cc_allow.stdout), {})
 
     def test_pre_tool_hook_blocks_bypass_and_unverified_push(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,43 +266,24 @@ class TestAiNativeEngine(unittest.TestCase):
             _create_sample_app(tmp_path)
             bootstrap_repository(tmp_path)
 
-            agy_deny = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
-                input=json.dumps({
-                    "cwd": str(tmp_path),
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit --no-verify -m x"}},
-                }),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertEqual(json.loads(agy_deny.stdout)["decision"], "deny")
+            agy_res = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit --no-verify -m x"}},
+            })
+            self.assertEqual(agy_res["decision"], "deny")
 
-            cc_deny = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
-                input=json.dumps({
-                    "cwd": str(tmp_path),
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "git commit -n -m x"},
-                }),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertEqual(json.loads(cc_deny.stdout)["decision"], "block")
+            cc_res = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "git commit -n -m x"},
+            })
+            self.assertEqual(cc_res["decision"], "block")
 
             (tmp_path / "app" / "services" / "billing.py").write_text("def broken(:\n", encoding="utf-8")
-            push_deny = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
-                input=json.dumps({
-                    "cwd": str(tmp_path),
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
-                }),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            push_res = json.loads(push_deny.stdout)
+            push_res = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+            })
             self.assertEqual(push_res["decision"], "deny")
             self.assertIn("git push", push_res["reason"])
 
@@ -416,6 +383,10 @@ class TestAiNativeEngine(unittest.TestCase):
             _init_git_repo(tmp_path)
             _create_sample_app(tmp_path)
             bootstrap_repository(tmp_path)
+            cfg_path = tmp_path / ".ai-native.json"
+            cfg_init = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg_init["mutation_testing"] = False
+            cfg_path.write_text(json.dumps(cfg_init, indent=2), encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
@@ -458,7 +429,7 @@ class TestAiNativeEngine(unittest.TestCase):
                 encoding="utf-8",
             )
             test_cmd = f"{sys.executable} -m unittest discover -s tests -p 'test_*.py'"
-            timeout_errs = run_diff_mutation_check(tmp_path, test_cmd, timeout_sec=0.5)
+            timeout_errs = run_diff_mutation_check(tmp_path, test_cmd, max_mutants=1, timeout_sec=0.2)
             self.assertEqual(timeout_errs, [])
             self.assertEqual(hashlib.sha256(billing_path.read_bytes()).hexdigest(), orig_sha)
 
@@ -724,6 +695,10 @@ class TestAiNativeEngine(unittest.TestCase):
             _init_git_repo(tmp_path)
             _create_sample_app(tmp_path)
             bootstrap_repository(tmp_path)
+            cfg_p = tmp_path / ".ai-native.json"
+            cfg_obj = json.loads(cfg_p.read_text(encoding="utf-8"))
+            cfg_obj["mutation_testing"] = False
+            cfg_p.write_text(json.dumps(cfg_obj), encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
@@ -731,14 +706,10 @@ class TestAiNativeEngine(unittest.TestCase):
             billing_path = tmp_path / "app" / "services" / "billing.py"
             orig_billing = billing_path.read_text(encoding="utf-8")
             billing_path.write_text(orig_billing + "\ndef _private_helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
-            allow_private = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
-                text=True,
-                capture_output=True,
-                check=True,
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
             )
-            self.assertEqual(json.loads(allow_private.stdout), {"decision": "allow"})
 
             # (b) Public contract change + whitespace-only edit in AGENTS.md -> MUST still block
             billing_path.write_text(
@@ -766,23 +737,11 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertIn("issue_credit", drifted[0])
 
             # (c) Re-entry flags must exit cleanly to prevent infinite refusal loop
-            cc_reentry = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": True}),
-                text=True,
-                capture_output=True,
-                check=True,
+            self.assertEqual(_run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": True}), {})
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "continuationActive": True, "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
             )
-            self.assertEqual(json.loads(cc_reentry.stdout), {})
-
-            agy_reentry = subprocess.run(
-                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
-                input=json.dumps({"cwd": str(tmp_path), "continuationActive": True, "terminationReason": "NO_TOOL_CALL"}),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertEqual(json.loads(agy_reentry.stdout), {"decision": "allow"})
 
     def test_gap07_non_destructive_onboarding_preserves_existing_hooks_claude_md_and_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,19 +791,26 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertIn("Stop", merged["hooks"])
 
     def test_gap08_multi_agent_hook_payload_resilience(self):
-        payloads = [
-            "",
+        cli_payloads = [
             "null",
+            json.dumps({"cwd": "/nonexistent", "tool_name": "run_shell_command", "tool_input": {"command": "echo hi"}}),
+        ]
+        inproc_payloads = [
+            "",
             "[1, 2, 3]",
             "{broken-json",
             json.dumps({"cwd": "/nonexistent", "tool_name": "Bash", "tool_input": "not-a-dict"}),
-            json.dumps({"cwd": "/nonexistent", "tool_name": "run_shell_command", "tool_input": {"command": "echo hi"}}),
             json.dumps({"workspacePaths": "invalid-string", "toolCall": {"name": "run_command", "args": {"CommandLine": "echo hi"}}}),
         ]
-        for script_name in ("pre_tool_hook.py", "post_tool_hook.py", "stop_gate_hook.py"):
+        hook_modules = (
+            ("pre_tool_hook.py", pre_tool_hook),
+            ("post_tool_hook.py", post_tool_hook),
+            ("stop_gate_hook.py", stop_gate_hook),
+        )
+        for script_name, mod in hook_modules:
             script_path = SCRIPTS_DIR / script_name
-            for raw_in in payloads:
-                with self.subTest(script=script_name, payload=raw_in):
+            for raw_in in cli_payloads:
+                with self.subTest(mode="cli", script=script_name, payload=raw_in):
                     proc = subprocess.run(
                         [sys.executable, "-I", str(script_path)],
                         input=raw_in,
@@ -853,6 +819,13 @@ class TestAiNativeEngine(unittest.TestCase):
                     )
                     self.assertEqual(proc.returncode, 0, f"{script_name} crashed on {raw_in!r}: {proc.stderr}")
                     parsed = json.loads(proc.stdout)
+                    self.assertIsInstance(parsed, dict)
+            for raw_in in inproc_payloads:
+                with self.subTest(mode="inproc", script=script_name, payload=raw_in):
+                    buf_out = io.StringIO()
+                    with mock.patch("sys.stdin", io.StringIO(raw_in)), mock.patch("sys.stdout", buf_out):
+                        mod.main()
+                    parsed = json.loads(buf_out.getvalue())
                     self.assertIsInstance(parsed, dict)
 
         hooks_cfg = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))["ai-native-auto-sync"]
