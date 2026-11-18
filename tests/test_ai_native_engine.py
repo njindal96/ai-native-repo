@@ -25,11 +25,14 @@ from sync_context import (  # noqa: E402
     END_MARKER,
     START_MARKER,
     adr_matches_directory,
+    build_context_capsule,
+    build_reverse_index,
     inspect_polyglot_file,
     parse_adr_frontmatter,
     sync_workspace,
 )
 from verify_architecture import (  # noqa: E402
+    check_adr_completeness,
     check_git_head_regressions,
     check_symbol_and_dataclass_resolution,
     run_diff_mutation_check,
@@ -831,6 +834,123 @@ class TestAiNativeEngine(unittest.TestCase):
         hooks_cfg = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))["ai-native-auto-sync"]
         self.assertGreaterEqual(hooks_cfg["PreToolUse"][0]["hooks"][0]["timeout"], 60)
         self.assertGreaterEqual(hooks_cfg["Stop"][0]["timeout"], 60)
+        self.assertIn("edit_file", hooks_cfg["PreToolUse"][0]["matcher"])
+
+    def test_reverse_index_used_by_tested_by_and_context_capsule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            used_by, tested_by = build_reverse_index(tmp_path)
+            self.assertEqual(used_by.get("app/domain/models.py"), ["app/services/billing.py"])
+            self.assertIn("tests/test_billing.py::test_charge", tested_by.get("app/services/billing.py", []))
+
+            domain_agents = (tmp_path / "app" / "domain" / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("- **Used By:** `app/services/billing.py`", domain_agents)
+
+            services_agents = (tmp_path / "app" / "services" / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("- **Tested By:** `tests/test_billing.py::test_charge`", services_agents)
+
+            capsule = build_context_capsule(tmp_path, "app/services/billing.py", mark_ledger=False)
+            self.assertIn("## 1. Governing Layer Guidance (`app/services/AGENTS.md`)", capsule)
+            self.assertIn("## 2. Architectural Rationale & Invariants", capsule)
+            self.assertIn("## Context & Why", capsule)
+            self.assertIn("- **Tested By (Verify With):** `tests/test_billing.py::test_charge`", capsule)
+
+            proc = subprocess.run(
+                [sys.executable, "-I", str(SCRIPTS_DIR / "sync_context.py"), "--workspace", str(tmp_path), "--for", "app/domain/models.py"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("- **Used By (Blast Radius):** `app/services/billing.py`", proc.stdout)
+
+    def test_pre_edit_context_gate_injects_capsule_once_then_allows(self):
+        # 1. Cold edit is blocked once with Context Capsule injected, then unlocked immediately
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            cold_edit = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "edit_file", "args": {"Path": str(tmp_path / "app" / "services" / "billing.py")}},
+            })
+            self.assertEqual(cold_edit["decision"], "deny")
+            self.assertIn("[ai-native-repo Pre-Edit Context Gate]", cold_edit["reason"])
+            self.assertIn("Context & Why", cold_edit["reason"])
+            self.assertIn("tests/test_billing.py::test_charge", cold_edit["reason"])
+
+            retry_edit = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "edit_file", "args": {"Path": str(tmp_path / "app" / "services" / "billing.py")}},
+            })
+            self.assertEqual(retry_edit, {"decision": "allow"})
+
+        # 2. Reading governing AGENTS.md + ADRs first via Read tool unlocks edit on first try (Claude Code schema)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(tmp_path / "app" / "services" / "AGENTS.md")},
+            })
+            # Still missing ADR -> should block once
+            partial_edit = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "tool_name": "Edit",
+                "tool_input": {"file_path": str(tmp_path / "app" / "services" / "billing.py")},
+            })
+            self.assertEqual(partial_edit["decision"], "block")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            for req in ("app/services/AGENTS.md", "docs/adr/001-ai-native-architecture.md"):
+                _run_hook_inproc(pre_tool_hook, {
+                    "cwd": str(tmp_path),
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": str(tmp_path / req)},
+                })
+            first_edit = _run_hook_inproc(pre_tool_hook, {
+                "cwd": str(tmp_path),
+                "tool_name": "Edit",
+                "tool_input": {"file_path": str(tmp_path / "app" / "services" / "billing.py")},
+            })
+            self.assertEqual(first_edit, {})
+
+    def test_adr_completeness_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            adr_dir = tmp_path / "docs" / "adr"
+            adr_dir.mkdir(parents=True)
+            bad_adr = adr_dir / "002-shallow.md"
+            bad_adr.write_text(
+                "---\nid: ADR-002\ntitle: Shallow ADR\napplies_to: *\nsummary: Brief.\n---\n\n# Only a title\nJust prose.\n",
+                encoding="utf-8",
+            )
+            errs = check_adr_completeness(tmp_path)
+            self.assertEqual(len(errs), 1)
+            self.assertIn("[Incomplete ADR Rationale]", errs[0])
+
+            bad_adr.write_text(
+                "---\nid: ADR-002\ntitle: Complete ADR\napplies_to: *\nsummary: Full rationale.\n---\n\n"
+                "## Context & Why\nEmpirical data showed 99% were cases.\n\n"
+                "## Decision & Invariants\nPreserve raw note.\n\n"
+                "## Anti-Patterns / Do Not Do\nDo not batch across items.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_adr_completeness(tmp_path), [])
 
 
 if __name__ == "__main__":

@@ -260,7 +260,7 @@ def merge_hooks_into_settings(settings_path: Path, plugin_dir: Optional[Path] = 
 
     desired = {
         "PreToolUse": {
-            "matcher": "run_command|Bash|run_shell_command|bash|shell|execute_command|terminal",
+            "matcher": "run_command|Bash|run_shell_command|bash|shell|execute_command|terminal|read_file|view_file|Read|edit_file|write_file|Edit|Write|MultiEdit",
             "hooks": [
                 {
                     "type": "command",
@@ -373,7 +373,15 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             "summary: Enforce hierarchical AGENTS.md contracts, AST boundary checks via .ai-native.json, and pre-commit auto-sync.\n"
             "---\n\n"
             "# ADR-001: AI-Native Architecture & Layer Boundaries\n\n"
-            "All modules follow `.ai-native.json` layer boundaries and auto-sync `AGENTS.md` contracts via `scripts/sync_context.py`.\n",
+            "## Context & Why\n"
+            "Autonomous coding agents degrade when architectural intent, layer isolation rules, and domain invariants "
+            "live in scattered docs. Placing machine-readable ADRs and `.ai-native.json` layer boundaries next to the "
+            "code keeps agent modifications aligned with original design intent.\n\n"
+            "## Decision & Invariants\n"
+            "- All modules follow `.ai-native.json` layer boundaries and auto-sync `AGENTS.md` contracts via `scripts/sync_context.py`.\n"
+            "- Run `python3 scripts/sync_context.py --for <file>` before modifying unfamiliar modules.\n\n"
+            "## Anti-Patterns / Do Not Do\n"
+            "- Never cross `forbidden_imports` boundaries or silently bypass verification gates.\n",
             encoding="utf-8",
         )
         actions.append("Created docs/adr/001-ai-native-architecture.md")

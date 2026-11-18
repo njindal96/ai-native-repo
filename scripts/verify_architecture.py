@@ -906,6 +906,54 @@ def run_diff_mutation_check(
     return issues
 
 
+def _strip_markdown_frontmatter(text: str) -> str:
+    norm = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    open_m = re.match(r"^---[ \t]*\n", norm)
+    if not open_m:
+        return norm
+    rest = norm[open_m.end():]
+    close_m = re.search(r"(?:^|\n)---[ \t]*(?:\n|$)", rest)
+    if not close_m:
+        return norm
+    return rest[close_m.end():]
+
+
+def check_adr_completeness(workspace_root: Path) -> list[str]:
+    """
+    Ensure every docs/adr/*.md captures both WHY a design exists and WHAT NOT to break:
+    1. A rationale/context heading (`## Context ...`, `## Why ...`, `## Rationale`, `## Background`)
+    2. A decision/invariants/anti-patterns heading (`## Decision ...`, `## Invariants`, `## Anti-Patterns / Do Not Do`)
+    """
+    issues: list[str] = []
+    adr_dir = workspace_root / "docs" / "adr"
+    if not adr_dir.is_dir():
+        return issues
+
+    why_pat = re.compile(r"^##+\s+.*\b(context|why|rationale|background)\b", re.I | re.M)
+    guard_pat = re.compile(r"^##+\s+.*\b(decision|invariants?|anti-patterns?|do\s+not|guardrails?)\b", re.I | re.M)
+
+    for adr_path in sorted(adr_dir.glob("*.md")):
+        if adr_path.name.lower() == "readme.md":
+            continue
+        rel = adr_path.relative_to(workspace_root).as_posix()
+        try:
+            body = _strip_markdown_frontmatter(adr_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        missing_parts: list[str] = []
+        if not why_pat.search(body):
+            missing_parts.append("'## Context / Why'")
+        if not guard_pat.search(body):
+            missing_parts.append("'## Decision & Invariants / Anti-Patterns'")
+        if missing_parts:
+            issues.append(
+                f"[Incomplete ADR Rationale] {rel} must include both a '## Context / Why' section and a "
+                f"'## Decision & Invariants / Anti-Patterns' section (missing: {', '.join(missing_parts)}) "
+                "so agents understand why the feature was built and what not to break."
+            )
+    return issues
+
+
 def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate: bool = False) -> list[str]:
     errors: list[str] = []
     config_path = workspace_root / ".ai-native.json"
@@ -985,7 +1033,8 @@ def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate:
     # 4. Anti-Test-Tampering, Public Contract Regression, Config/Hooks Tampering & Blast-Radius Check vs HEAD
     errors.extend(check_git_head_regressions(workspace_root, config))
 
-    # 5. Progressive Disclosure Context Budget Check
+    # 5. Progressive Disclosure Context Budget & ADR Rationale Check
+    errors.extend(check_adr_completeness(workspace_root))
     budget = config.get("context_budget", {"max_lines": 200, "max_bytes": 20000})
     max_lines = budget.get("max_lines", 200)
     max_bytes = budget.get("max_bytes", 20000)

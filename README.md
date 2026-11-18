@@ -1,24 +1,25 @@
-# `ai-native-repo` — Real-Time Context & Zero-Collateral Verification Engine (v3.1)
+# `ai-native-repo` — Real-Time Context & Zero-Collateral Verification Engine (v3.2)
 
-Turn any repository into a **self-updating, guardrail-enforced codebase** built for autonomous AI software engineers (**Antigravity**, **Claude Code**, **Cursor**, **Codex**, and **Gemini CLI**).
+Turn any repository into a **self-updating, context-first, guardrail-enforced codebase** built for autonomous AI software engineers (**Antigravity**, **Claude Code**, **Cursor**, **Codex**, and **Gemini CLI**).
 
-**Zero external dependencies** (pure Python 3 stdlib). **Zero manual doc maintenance.** **Zero silent agent regressions.**
+**Zero external dependencies** (pure Python 3 stdlib). **Single-hop Context Capsules (`--for`).** **Zero silent agent regressions.**
 
 ---
 
 ## Why `ai-native-repo`? (Benefits & Problem Solved)
 
 Human docs and traditional unit tests break down when AI agents write code autonomously:
-1. Documentation rots on the first edit, or floods context windows if kept in one giant file.
-2. Agents share blind spots with the tests they write (the **"Tautology Trap"**), hallucinate symbols in unexecuted branches, or cause collateral damage across layers.
-3. Under outcome pressure (*"make tests pass"*), agents can **reward-hack** by weakening assertions, skipping failing tests, or running `git commit --no-verify` / `git commit -amn` / `git -c core.hooksPath=/dev/null`.
+1. **Agents miss the "Why":** Without knowing *why* code was built a certain way and *what alternatives were rejected*, agents propose harmful "improvements" that re-introduce domain bugs.
+2. **Agents waste turns grepping:** Without reverse dependencies (`Used By`) and test mappings (`Tested By`), agents make 5–15 exploratory calls before editing one function.
+3. **Tautological tests & reward-hacking:** Agents write weak tests, hallucinate symbols in unexecuted branches, weaken assertions, or run `git commit -n` / `--no-verify`.
 
 ### Before vs. After
 
-| Dimension | Traditional Repo | With `ai-native-repo` v3.1 |
+| Dimension | Traditional Repo | With `ai-native-repo` v3.2 |
 | :--- | :--- | :--- |
-| **Agent Onboarding** | New agent wastes 5–15 tool calls grepping files to understand layout & rules. | Agent reads lean root `AGENTS.md` (<200 lines) + scoped layer `AGENTS.md` (existing `CLAUDE.md` merged cleanly). |
-| **Doc Freshness** | Function signatures, dataclasses, and module maps go stale immediately. | `PostToolUse` hook + `.githooks/pre-commit` re-sync `<!-- AUTO-GENERATED -->` contracts cleanly in `<50ms`. |
+| **Agent Onboarding & Context Time** | New agent wastes 5–15 tool calls grepping files, callers, and tests. | **Single-hop Context Capsule (`python3 scripts/sync_context.py --for <file>`)** returns governing `AGENTS.md`, full ADR `Why`/`Do Not Do`, `Used By` callers, and `Tested By` test functions in one call. |
+| **Enforcing the "Why" Before Editing** | Agent edits production files blind and breaks original domain assumptions. | **`PreToolUse` Pre-Edit Context Gate** tracks `AGENTS.md`/`docs/adr/*.md` reads and blocks blind edits once while injecting the Context Capsule inline; `check_adr_completeness()` enforces `Context / Why` & `Anti-Patterns` sections in all ADRs. |
+| **Doc Freshness & Reverse Graph** | Signatures, callers, and tests go stale immediately. | `PostToolUse` hook + `.githooks/pre-commit` re-sync `<!-- AUTO-GENERATED -->` contracts, `Used By` blast radius, and `Tested By` targets in `<50ms`. |
 | **Hallucinations & Stubs** | Unexecuted branches hide hallucinated imports, wrong dataclass fields, or `NotImplementedError` stubs. | Cross-module Python AST resolver checks imports (including relative & `__init__.py` re-exports), module aliases, and inherited `@dataclass` fields (`init=False` / `KW_ONLY` aware). |
 | **Collateral Damage & Test Tampering** | Agent deletes tests, weakens assertions, drops model fields, edits `.ai-native.json`, or bypasses hooks with `-n`. | `PreToolUse` tokenizes shell commands to block `-n`/`--no-verify`/`core.hooksPath` overrides & `chmod -x`; `verify_architecture.py` checks tests, dataclasses, `.ai-native.json`, and `.githooks/` vs `HEAD`. |
 | **Weak / Tautological Tests** | Agent writes trivial tests that pass even if logic is broken. | **Isolated tempdir diff-scoped AST micro-mutation testing** tests changed Python branches with per-mutant timeout (zero working-tree corruption). |
@@ -96,13 +97,18 @@ your-repo/
 ├── docs/adr/
 │   └── 001-ai-native-architecture.md  # Starter machine-readable ADR (YAML frontmatter routed)
 ├── scripts/
-│   ├── sync_context.py           # Portable Tier 1 AST + Tier 2 lexical introspector & ADR router
-│   └── verify_architecture.py    # Portable v3.1 verifier (boundaries, hallucinations, regressions, isolated mutations)
+│   ├── sync_context.py           # Portable Tier 1 AST + Tier 2 lexical introspector, --for Context Capsule & ADR router
+│   └── verify_architecture.py    # Portable v3.2 verifier (boundaries, ADR Why check, hallucinations, isolated mutations)
 └── .githooks/
     ├── pre-commit                # Chains pre-commit.local (if present), syncs AGENTS.md & runs verify_architecture.py
     └── pre-push                  # Chains pre-push.local (if present) & runs full verify_architecture.py
 ```
 Plus a scoped `AGENTS.md` inside each auto-detected code directory (e.g., `app/domain/AGENTS.md`, `app/services/AGENTS.md`).
+
+Fetch a single-hop Context Capsule for any file at any time:
+```bash
+python3 scripts/sync_context.py --for app/services/billing.py
+```
 
 ---
 
@@ -115,6 +121,7 @@ Plus a scoped `AGENTS.md` inside each auto-detected code directory (e.g., `app/d
      "context_budget": { "max_lines": 200, "max_bytes": 20000 },
      "test_command": "python3 -m unittest discover -s tests -p 'test_*.py'",
      "enforce_contract_compatibility": true,
+     "enforce_pre_edit_context": true,
      "mutation_testing": true,
      "max_mutants": 25,
      "max_layers_touched": 3,
@@ -139,10 +146,19 @@ Plus a scoped `AGENTS.md` inside each auto-detected code directory (e.g., `app/d
      - app/api/*
    summary: All billing endpoints must pass an idempotency_key header; never retry blindly.
    ---
+
+   ## Context & Why
+   Explain why this architecture exists and what production bug or constraint shaped it.
+
+   ## Decision & Invariants
+   State what must hold true in the final state after any change.
+
+   ## Anti-Patterns / Do Not Do
+   Explicitly list rejected alternatives or dangerous shortcuts.
    ```
 3. **Commit the Onboarded Files:**
    ```bash
-   git add .ai-native.json AGENTS.md CLAUDE.md docs/adr/ scripts/ .githooks/ && git commit -m "Onboard repo to ai-native-repo v3.1"
+   git add .ai-native.json AGENTS.md CLAUDE.md docs/adr/ scripts/ .githooks/ && git commit -m "Onboard repo to ai-native-repo v3.2"
    ```
 
 ## License

@@ -2,7 +2,7 @@
   "ai-native-auto-sync": {
     "PreToolUse": [
       {
-        "matcher": "run_command|Bash|run_shell_command|bash|shell|execute_command|terminal",
+        "matcher": "run_command|Bash|run_shell_command|bash|shell|execute_command|terminal|read_file|view_file|Read|edit_file|write_file|Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",

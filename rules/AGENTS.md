@@ -2,9 +2,9 @@
 
 When operating as a software engineering agent in any repository with `AGENTS.md`:
 
-1. **Progressive Context Navigation:**
-   - Start at root `AGENTS.md` (<200 lines) for the global map, commands, and layer table.
-   - Before editing any directory, read its local `AGENTS.md` and any linked `docs/adr/*.md` files whose `applies_to` matches your target files.
+1. **Progressive & Single-Hop Context Navigation:**
+   - Start at root `AGENTS.md` (<200 lines) for the global map, commands, and layer table, or run `python3 scripts/sync_context.py --for <target_file>` to fetch the full Context Capsule (Why/ADRs, `Used By` callers, `Tested By` tests, and live contract) in one call.
+   - Before editing any directory, read its local `AGENTS.md` and any linked `docs/adr/*.md` files (especially `Context & Why`, `Decision & Invariants`, and `Anti-Patterns / Do Not Do`) whose `applies_to` matches your target files.
 2. **Respect Explicit Action Tiers (`Always` / `Ask First` / `Never`):**
    - Never violate `Never` rules or cross forbidden layer import boundaries declared in `.ai-native.json`.
    - Never weaken or delete existing tests, skip assertions, drop public `@dataclass` fields, or pass `--no-verify` to bypass Git hooks.

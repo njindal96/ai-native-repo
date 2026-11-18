@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Polyglot Context & ADR Introspector (v3.1 — Pure Python 3 Stdlib)
+Polyglot Context & ADR Introspector (v3.2 — Pure Python 3 Stdlib)
 Updates <!-- AUTO-GENERATED:START --> ... <!-- AUTO-GENERATED:END --> blocks
 across all AGENTS.md files with:
-- Tier 1 Python (.py): Full AST classes, dataclasses, async/sync functions, constants, relative/absolute imports
+- Tier 1 Python (.py): Full AST classes, dataclasses, async/sync functions, constants,
+  relative/absolute imports, reverse callers (Used By), and test mappings (Tested By)
 - Tier 2 Polyglot (.ts, .tsx, .js, .jsx, .mjs, .go, .rs, .java): Comment/string-stripped lexical exports
 - Machine-readable ADR index (from docs/adr/*.md YAML frontmatter, CRLF & list safe)
+- Single-hop Context Capsule (--for <file>) & session context ledger helpers
 - Context budget telemetry (line count)
 """
 from __future__ import annotations
@@ -13,7 +15,12 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import hashlib
+import json
+import os
 import re
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -161,6 +168,320 @@ def adr_matches_directory(adr: dict, rel_dir: str) -> bool:
         if pat_clean == rel_dir or pat_clean.startswith(rel_dir + "/"):
             return True
     return False
+
+
+def adr_matches_path(adr: dict, rel_path: str) -> bool:
+    norm = Path(rel_path).as_posix().lstrip("./")
+    patterns = adr.get("applies_to_list") or _parse_applies_to_value(str(adr.get("applies_to", "*"))) or ["*"]
+    for pat in patterns:
+        pat_clean = pat.strip().lstrip("./")
+        if not pat_clean:
+            continue
+        if pat_clean == "*":
+            return True
+        if fnmatch.fnmatch(norm, pat_clean):
+            return True
+        dir_prefix = pat_clean.rstrip("/*")
+        if dir_prefix and (norm == dir_prefix or norm.startswith(dir_prefix + "/")):
+            return True
+    return False
+
+
+def _attr_chain(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _attr_chain(node.value)
+        return f"{prefix}.{node.attr}" if prefix else ""
+    return ""
+
+
+def _extract_used_refs(node: ast.AST) -> set[str]:
+    refs: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            refs.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            chain = _attr_chain(sub)
+            if chain:
+                refs.add(chain)
+    return refs
+
+
+def build_reverse_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    Build repo-wide reverse maps for Python modules:
+    - used_by[target_rel]: sorted non-test source files importing target_rel
+    - tested_by[target_rel]: sorted `test_file::test_fn` (or `test_file`) referencing target_rel
+    """
+    mod_to_rel: dict[str, str] = {}
+    py_files: list[tuple[str, Path]] = []
+
+    for pf in sorted(repo_root.rglob("*.py")):
+        if any(part in IGNORE_DIRS for part in pf.relative_to(repo_root).parts):
+            continue
+        rel = pf.relative_to(repo_root).as_posix()
+        py_files.append((rel, pf))
+        if pf.name == "__init__.py":
+            mod_name = ".".join(pf.relative_to(repo_root).parent.parts)
+        else:
+            mod_name = ".".join(pf.relative_to(repo_root).with_suffix("").parts)
+        if mod_name:
+            mod_to_rel[mod_name] = rel
+
+    used_by_sets: dict[str, set[str]] = {}
+    tested_by_sets: dict[str, set[str]] = {}
+
+    for rel, pf in py_files:
+        try:
+            tree = ast.parse(pf.read_text(encoding="utf-8"), filename=str(pf))
+        except Exception:
+            continue
+
+        target_refs: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    t_rel = mod_to_rel.get(alias.name)
+                    if t_rel and t_rel != rel:
+                        ref = alias.asname or alias.name
+                        target_refs.setdefault(t_rel, set()).add(ref)
+            elif isinstance(node, ast.ImportFrom):
+                base_mod = (
+                    resolve_relative_import(rel, node.module, node.level)
+                    if node.level > 0
+                    else (node.module or "")
+                )
+                if not base_mod:
+                    continue
+                for alias in node.names:
+                    local_name = alias.asname or alias.name
+                    sub_mod = f"{base_mod}.{alias.name}" if alias.name != "*" else ""
+                    if sub_mod and sub_mod in mod_to_rel:
+                        t_rel = mod_to_rel[sub_mod]
+                        if t_rel != rel:
+                            target_refs.setdefault(t_rel, set()).add(local_name)
+                    elif base_mod in mod_to_rel:
+                        t_rel = mod_to_rel[base_mod]
+                        if t_rel != rel:
+                            target_refs.setdefault(t_rel, set()).add("*" if alias.name == "*" else local_name)
+
+        if not target_refs:
+            continue
+
+        is_test = rel.startswith("tests/") or pf.name.startswith("test_")
+        if not is_test:
+            for t_rel in target_refs:
+                used_by_sets.setdefault(t_rel, set()).add(rel)
+        else:
+            test_fns = [
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
+            ]
+            matched_targets: set[str] = set()
+            for fn in test_fns:
+                used = _extract_used_refs(fn)
+                for t_rel, refs in target_refs.items():
+                    if "*" in refs or (refs & used):
+                        tested_by_sets.setdefault(t_rel, set()).add(f"{rel}::{fn.name}")
+                        matched_targets.add(t_rel)
+            for t_rel in target_refs:
+                if t_rel not in matched_targets:
+                    tested_by_sets.setdefault(t_rel, set()).add(rel)
+
+    used_by = {k: sorted(v) for k, v in used_by_sets.items()}
+    tested_by = {k: sorted(v) for k, v in tested_by_sets.items()}
+    return used_by, tested_by
+
+
+def _normalize_rel_path(repo_root: Path, file_path: str) -> str:
+    p = Path(file_path)
+    resolved_root = repo_root.resolve()
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(resolved_root).as_posix()
+        except Exception:
+            return p.as_posix()
+    return p.as_posix().lstrip("./")
+
+
+def get_context_ledger_path(repo_root: Path) -> Path:
+    resolved = repo_root.resolve()
+    git_dir = resolved / ".git"
+    if git_dir.is_dir() and os.access(git_dir, os.W_OK):
+        return git_dir / "ai_native_context_ledger.json"
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"ai_native_ledger_{digest}.json"
+
+
+def _load_ledger(ledger_path: Path, now: float, ttl_seconds: int) -> dict[str, float]:
+    if not ledger_path.exists():
+        return {}
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): float(v)
+            for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, (int, float)) and (now - float(v)) <= ttl_seconds
+        }
+    except Exception:
+        return {}
+
+
+def record_context_read(repo_root: Path, rel_paths: list[str], ttl_seconds: int = 14400) -> None:
+    if not rel_paths:
+        return
+    now = time.time()
+    ledger_path = get_context_ledger_path(repo_root)
+    entries = _load_ledger(ledger_path, now, ttl_seconds)
+    for rp in rel_paths:
+        norm = _normalize_rel_path(repo_root, rp)
+        if norm:
+            entries[norm] = now
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        digest = hashlib.sha256(str(repo_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        fallback = Path(tempfile.gettempdir()) / f"ai_native_ledger_{digest}.json"
+        try:
+            fallback.write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _find_nearest_agents_rel(repo_root: Path, target_rel: str) -> Optional[str]:
+    norm = _normalize_rel_path(repo_root, target_rel)
+    cur = (repo_root / norm).parent.resolve()
+    root_res = repo_root.resolve()
+    while True:
+        candidate = cur / "AGENTS.md"
+        if candidate.is_file():
+            return candidate.relative_to(root_res).as_posix()
+        if cur == root_res or root_res not in cur.parents:
+            break
+        cur = cur.parent
+    return None
+
+
+def _get_required_context_files(repo_root: Path, target_rel: str) -> list[str]:
+    req: list[str] = []
+    agents_rel = _find_nearest_agents_rel(repo_root, target_rel)
+    if agents_rel:
+        req.append(agents_rel)
+    for adr in load_all_adrs(repo_root):
+        if adr_matches_path(adr, target_rel):
+            req.append(adr["rel_path"])
+    return req
+
+
+def has_context_for_target(repo_root: Path, target_rel: str, ttl_seconds: int = 14400) -> tuple[bool, list[str]]:
+    norm = _normalize_rel_path(repo_root, target_rel)
+    required = _get_required_context_files(repo_root, norm)
+    if not required:
+        return True, []
+
+    now = time.time()
+    ledger_path = get_context_ledger_path(repo_root)
+    entries = _load_ledger(ledger_path, now, ttl_seconds)
+    if not entries:
+        digest = hashlib.sha256(str(repo_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        alt = Path(tempfile.gettempdir()) / f"ai_native_ledger_{digest}.json"
+        if alt != ledger_path:
+            entries = _load_ledger(alt, now, ttl_seconds)
+
+    if norm in entries:
+        return True, []
+
+    missing = [f for f in required if f not in entries]
+    if not missing:
+        return True, []
+    return False, missing
+
+
+def _extract_semantic_section(agents_md: Path) -> str:
+    text = agents_md.read_text(encoding="utf-8")
+    start_m = re.search(rf"^[ \t]*{re.escape(START_MARKER)}[ \t]*$", text, re.M)
+    end_m = re.search(rf"^[ \t]*{re.escape(END_MARKER)}[ \t]*$", text, re.M)
+    if start_m and end_m and end_m.start() > start_m.end():
+        return (text[:start_m.start()] + "\n" + text[end_m.end():]).strip()
+    return text.strip()
+
+
+def _strip_frontmatter(md_text: str) -> str:
+    normalized = md_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    open_m = re.match(r"^---[ \t]*\n", normalized)
+    if not open_m:
+        return normalized.strip()
+    rest = normalized[open_m.end():]
+    close_m = re.search(r"(?:^|\n)---[ \t]*(?:\n|$)", rest)
+    if not close_m:
+        return normalized.strip()
+    return rest[close_m.end():].strip()
+
+
+def build_context_capsule(repo_root: Path, target_file: str, mark_ledger: bool = True) -> str:
+    """
+    Assemble a single-hop Context Capsule for `target_file`:
+    - Governing scoped AGENTS.md prose
+    - Full bodies of matching ADRs (Why / Invariants / Do Not Do)
+    - Target file AST/lexical contract, Used By callers, and Tested By targets
+    Optionally marks the session context ledger so the next edit is unlocked.
+    """
+    repo_root = repo_root.resolve()
+    target_rel = _normalize_rel_path(repo_root, target_file)
+    target_path = repo_root / target_rel
+
+    lines: list[str] = [f"# Context Capsule for `{target_rel}`", ""]
+
+    agents_rel = _find_nearest_agents_rel(repo_root, target_rel)
+    if agents_rel and (repo_root / agents_rel).is_file():
+        lines.append(f"## 1. Governing Layer Guidance (`{agents_rel}`)")
+        lines.append(_extract_semantic_section(repo_root / agents_rel))
+        lines.append("")
+
+    adrs = [a for a in load_all_adrs(repo_root) if adr_matches_path(a, target_rel)]
+    if adrs:
+        lines.append("## 2. Architectural Rationale & Invariants (ADRs — Why / Do Not Do)")
+        for adr in adrs:
+            adr_file = repo_root / adr["rel_path"]
+            lines.append(f"### `{adr['id']}` (`{adr['rel_path']}`): {adr['title']}")
+            if adr_file.is_file():
+                lines.append(_strip_frontmatter(adr_file.read_text(encoding="utf-8")))
+            lines.append("")
+
+    lines.append(f"## 3. Target Module Contract, Blast Radius & Tests (`{target_rel}`)")
+    if target_path.is_file() and target_path.suffix == ".py":
+        used_by, tested_by = build_reverse_index(repo_root)
+        info = inspect_python_file(target_path, repo_root)
+        lines.append("- **Internal Imports:** " + (", ".join(f"`{i}`" for i in info.get("internal_imports", [])) or "_None_"))
+        lines.append("- **Used By (Blast Radius):** " + (", ".join(f"`{u}`" for u in used_by.get(target_rel, [])) or "_None_"))
+        lines.append("- **Tested By (Verify With):** " + (", ".join(f"`{t}`" for t in tested_by.get(target_rel, [])) or "_None_"))
+        if info.get("constants"):
+            lines.append("- **Constants:** " + ", ".join(f"`{c}`" for c in info["constants"]))
+        for cls in info.get("classes", []):
+            kind = "Dataclass" if cls["is_dataclass"] else "Class"
+            base_str = f"({', '.join(cls['bases'])})" if cls["bases"] else ""
+            lines.append(f"- **{kind} `{cls['name']}{base_str}`**")
+            if cls["fields"]:
+                lines.append("  - Fields: " + ", ".join(f"`{f}`" for f in cls["fields"]))
+            for m in cls["methods"]:
+                lines.append(f"  - Method: `{m}`")
+        for fn in info.get("functions", []):
+            lines.append(f"- **Function:** `{fn}`")
+    elif target_path.is_file() and target_path.suffix.lower() in POLYGLOT_EXTENSIONS:
+        t_info = inspect_polyglot_file(target_path, repo_root)
+        lines.append("- **Exports:** " + (", ".join(f"`{e}`" for e in t_info.get("exports", [])) or "_None_"))
+    elif not target_path.exists():
+        lines.append(f"- _Target file `{target_rel}` does not exist on disk yet._")
+
+    if mark_ledger:
+        required = _get_required_context_files(repo_root, target_rel)
+        record_context_read(repo_root, [target_rel] + required)
+
+    return "\n".join(lines).strip() + "\n"
 
 
 def load_all_adrs(repo_root: Path) -> list[dict]:
@@ -449,7 +770,18 @@ def build_root_block(repo_root: Path) -> str:
     return "\n".join(lines)
 
 
-def build_directory_block(dir_path: Path, repo_root: Path) -> str:
+def _format_capped_refs(items: list[str], cap: int = 8) -> str:
+    shown = [f"`{it}`" for it in items[:cap]]
+    if len(items) > cap:
+        shown.append(f"_(+{len(items) - cap} more; use `--for`)_")
+    return ", ".join(shown)
+
+
+def build_directory_block(
+    dir_path: Path,
+    repo_root: Path,
+    reverse_index: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None,
+) -> str:
     rel_dir = dir_path.relative_to(repo_root).as_posix()
     lines = [
         START_MARKER,
@@ -478,15 +810,22 @@ def build_directory_block(dir_path: Path, repo_root: Path) -> str:
         lines.append(END_MARKER)
         return "\n".join(lines)
 
+    used_by, tested_by = reverse_index if reverse_index is not None else build_reverse_index(repo_root)
+
     for pf in py_files:
         info = inspect_python_file(pf, repo_root)
-        lines.append(f"#### `{info['rel_path']}`")
+        rel_p = info["rel_path"]
+        lines.append(f"#### `{rel_p}`")
         if info.get("error"):
             lines.append(f"- **Syntax Error:** `{info['error']}`")
             lines.append("")
             continue
         if info["internal_imports"]:
             lines.append("- **Internal Imports:** " + ", ".join(f"`{imp}`" for imp in info["internal_imports"]))
+        if used_by.get(rel_p):
+            lines.append("- **Used By:** " + _format_capped_refs(used_by[rel_p]))
+        if tested_by.get(rel_p):
+            lines.append("- **Tested By:** " + _format_capped_refs(tested_by[rel_p]))
         if info["constants"]:
             lines.append("- **Constants:** " + ", ".join(f"`{c}`" for c in info["constants"]))
         for cls in info["classes"]:
@@ -515,7 +854,11 @@ def build_directory_block(dir_path: Path, repo_root: Path) -> str:
     return "\n".join(lines)
 
 
-def sync_agents_file(agents_md: Path, repo_root: Path) -> bool:
+def sync_agents_file(
+    agents_md: Path,
+    repo_root: Path,
+    reverse_index: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None,
+) -> bool:
     content = agents_md.read_text(encoding="utf-8")
     start_m = re.search(rf"^[ \t]*{re.escape(START_MARKER)}[ \t]*$", content, re.M)
     end_m = re.search(rf"^[ \t]*{re.escape(END_MARKER)}[ \t]*$", content, re.M)
@@ -523,7 +866,11 @@ def sync_agents_file(agents_md: Path, repo_root: Path) -> bool:
         return False
 
     is_root = (agents_md.parent.resolve() == repo_root.resolve())
-    new_block = build_root_block(repo_root) if is_root else build_directory_block(agents_md.parent, repo_root)
+    new_block = (
+        build_root_block(repo_root)
+        if is_root
+        else build_directory_block(agents_md.parent, repo_root, reverse_index=reverse_index)
+    )
 
     updated = content[:start_m.start()] + new_block + content[end_m.end():]
 
@@ -543,21 +890,31 @@ def sync_workspace(workspace_root: Path) -> list[str]:
     )
     non_root = [p for p in agents_files if p.parent.resolve() != workspace_root.resolve()]
     root_files = [p for p in agents_files if p.parent.resolve() == workspace_root.resolve()]
+    reverse_index = build_reverse_index(workspace_root) if non_root else ({}, {})
     for af in non_root + root_files:
-        if sync_agents_file(af, workspace_root):
+        if sync_agents_file(af, workspace_root, reverse_index=reverse_index):
             modified.append(af.relative_to(workspace_root).as_posix())
     # Second pass on root if non_root changed line counts
     for af in root_files:
-        if sync_agents_file(af, workspace_root) and af.relative_to(workspace_root).as_posix() not in modified:
+        if sync_agents_file(af, workspace_root, reverse_index=reverse_index) and af.relative_to(workspace_root).as_posix() not in modified:
             modified.append(af.relative_to(workspace_root).as_posix())
     return modified
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync AGENTS.md auto-generated contract blocks.")
+    parser = argparse.ArgumentParser(description="Sync AGENTS.md auto-generated contract blocks or print a target Context Capsule.")
     parser.add_argument("--workspace", default=".", help="Workspace root directory")
+    parser.add_argument(
+        "--for",
+        dest="target_file",
+        default="",
+        help="Print single-hop Context Capsule (Why/ADRs, callers, tests, contract) for a target file and mark session context ledger",
+    )
     args = parser.parse_args()
     root = Path(args.workspace).resolve()
+    if args.target_file:
+        print(build_context_capsule(root, args.target_file, mark_ledger=True))
+        return
     changed = sync_workspace(root)
     if changed:
         print(f"[ai-native-repo] Updated {len(changed)} AGENTS.md file(s): {', '.join(changed)}")

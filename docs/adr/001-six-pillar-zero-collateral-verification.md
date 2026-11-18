@@ -12,9 +12,13 @@ summary: Enforce PreToolUse hook-bypass blocking, cross-module AST symbol resolu
 Traditional unit test runners do not stop autonomous coding agents from reward-hacking (weakening assertions, skipping failing tests, using `--no-verify`), hallucinating imports/fields in unexecuted branches, causing collateral contract regressions across layers, or writing tautological tests that pass even when core conditions are inverted.
 
 ## Decision & Invariants
-1. **Pillar 1 (`PreToolUse` Gate):** `scripts/pre_tool_hook.py` hard-blocks `--no-verify` / `git commit -n` and gates `git push` behind `verify_workspace(target, run_tests=True)`.
+1. **Pillar 1 (`PreToolUse` Shell & Pre-Edit Context Gate):** `scripts/pre_tool_hook.py` hard-blocks `--no-verify` / `git commit -n` / `core.hooksPath` overrides, gates `git push` behind `verify_workspace(target, run_tests=True)`, and tracks reads of `AGENTS.md` / `docs/adr/*.md` to block blind edits to existing layer files while injecting a single-hop **Context Capsule** (Why/ADRs, `Used By` callers, `Tested By` targets).
 2. **Pillar 2 (Anti-Hallucination & Hygiene):** `verify_architecture.py` statically checks bare `except: pass`, unimplemented non-abstract `NotImplementedError` stubs, hardcoded secret patterns, cross-module `from <internal> import <sym>` definitions, and `@dataclass` keyword arguments.
 3. **Pillar 3 (Anti-Regression & Blast-Radius Guard):** Compares working tree AST against `git HEAD` to block deleted tests, newly skipped tests, reduced assertion counts, removed `@dataclass` fields, and layer blast-radius overruns (`max_layers_touched`).
-4. **Pillar 4 (Domain Invariants & Golden Contracts):** Target repositories embed explicit `validate_invariants()` methods and golden fixture assertions.
-5. **Pillar 5 (Diff-Scoped AST Micro-Mutation Testing):** `run_diff_mutation_check` mutates boolean/comparison nodes on lines touched in `git diff HEAD` (restoring the file in `finally:`) and flags surviving mutants when tests fail to catch inverted logic.
-6. **Pillar 6 (Semantic Drift Gate):** `stop_gate_hook.py` blocks agent completion if a scoped `AGENTS.md` contract block changed without updating semantic notes.
+4. **Pillar 4 (Domain Invariants & ADR Rationale Enforcement):** Target repositories embed explicit `validate_invariants()` methods, golden fixture assertions, and complete ADRs validated by `check_adr_completeness()` (requiring `Context / Why` and `Decision / Invariants / Anti-Patterns`).
+5. **Pillar 5 (Diff-Scoped AST Micro-Mutation Testing):** `run_diff_mutation_check` mutates boolean/comparison nodes on lines touched in `git diff HEAD` inside an isolated `TemporaryDirectory` copy with hard per-mutant timeouts, flagging surviving mutants when tests fail to catch inverted logic.
+6. **Pillar 6 (Semantic Drift Gate & Single-Hop Context):** `sync_context.py` indexes `Used By` and `Tested By` and supports `--for <file>` Context Capsules; `stop_gate_hook.py` blocks agent completion if a scoped `AGENTS.md` public contract changed without updating semantic notes.
+
+## Anti-Patterns / Do Not Do
+- Never add third-party PyPI packages inside `scripts/`; everything must remain runnable under `python3 -I`.
+- Never allow agents to modify production layer code blind without delivering the governing `Context / Why` and `Do Not Do` invariants.
