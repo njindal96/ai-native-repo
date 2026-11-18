@@ -6,9 +6,10 @@
 >    `python3 ~/.gemini/config/plugins/ai-native-repo/scripts/bootstrap_repo.py --workspace /path/to/target-repo`
 > 3. Customize `.ai-native.json` layer boundaries, `AGENTS.md` domain invariants, and `docs/adr/` entries for the target project.
 
-## 1. Repository Overview & Zero-Dependency Contract (v3.1 Hardened)
+## 1. Repository Overview & Zero-Dependency Contract (v3.3 Hardened)
 - **Purpose:** Reusable cross-agent plugin (`hooks.json`, `rules/`, `skills/`) + standalone scripts (`sync_context.py`, `verify_architecture.py`, `bootstrap_repo.py`, `pre_tool_hook.py`, `post_tool_hook.py`, `stop_gate_hook.py`) implementing Zero-Collateral Agentic Engineering.
 - **Zero-Dependency Rule:** All Python scripts under `scripts/` MUST use **Python 3 standard library only** (`ast`, `json`, `pathlib`, `shlex`, `tempfile`, `py_compile`, `subprocess`, `shutil`) and pass under `python3 -I` (isolated mode).
+- **Universal Multi-Repo Scalability & Compatibility Rule (Default):** Every change in `ai-native-repo` MUST be 100% repository-agnostic and stack-agnostic (supporting Python and Tier-2 Polyglot TS/JS/Go/Rust/Java repositories out of the box), automatically propagate updated scripts to all previously onboarded repositories (`auto_upgrade_repo_scripts()` in `post_tool_hook.py` and non-destructive upgrades in `bootstrap_repo.py`), and maintain strict backward compatibility across all 5 agent hosts (Antigravity, Claude Code, Cursor, Codex, Gemini CLI) and legacy `.ai-native.json` / ADR schemas.
 - **Hardened Guarantees (v3.3):**
   - **Scalable Auto-Propagation & Polyglot Support (`post_tool_hook.py`, `bootstrap_repo.py`):** `post_tool_hook.py` automatically propagates updated plugin `sync_context.py`/`verify_architecture.py` scripts into any onboarded repo (`auto_upgrade_repo_scripts()`) and supports configurable `"poll_command_prefixes"` in `.ai-native.json`; `bootstrap_repo.py` detects Python/Node/Go/Rust/Java test commands and non-destructively upgrades legacy `.ai-native.json` and `docs/adr/*.md` files.
   - **Silent Friction & Opportunity Detector (`post_tool_hook.py` + `stop_gate_hook.py`):** Passively records zero-token per-workspace tool telemetry (`READ_SEARCH_TOOLS`, `EDIT_TOOLS`, `SHELL_TOOLS`) and surfaces a 1-shot cooldown-guarded nudge at `Stop` only when one of 4 hard thresholds fires: uncaptured course-correction (rework/revert without ADR update), context thrashing (`>=8` reads before edit in an un-onboarded repo), repeated 3-step command sequences (`>=3` times), or recurring polling commands (`>=3` times).
@@ -20,17 +21,17 @@
 
 ## 2. Verification & Operational Tiers
 - **Isolated Tests & Self-Verify:** `python3 -I -m unittest discover -s tests -p 'test_*.py' && python3 scripts/sync_context.py && python3 scripts/verify_architecture.py`
-- **Always:** Keep `scripts/sync_context.py` and `scripts/verify_architecture.py` standalone and copy-safe; maintain regression coverage in `tests/test_ai_native_engine.py`; commit with `.githooks` enabled (`Never --no-verify`).
+- **Always:** Design every hook, verifier, and introspector change to scale across all installed repositories with backward-compatible defaults and automatic script propagation; keep `scripts/sync_context.py` and `scripts/verify_architecture.py` standalone and copy-safe; maintain regression coverage in `tests/test_ai_native_engine.py`; commit with `.githooks` enabled (`Never --no-verify`).
 - **Ask First:** Changing `.ai-native.json` schema keys or `<!-- AUTO-GENERATED:START -->` / `<!-- AUTO-GENERATED:END -->` marker format.
-- **Never:** Add external dependencies to `scripts/`; exceed 200 lines in `AGENTS.md`.
+- **Never:** Hardcode project-specific paths, commands, or domain assumptions inside `ai-native-repo`; break backward compatibility with existing onboarded repositories or agent hook schemas; add external dependencies to `scripts/`; exceed 200 lines in `AGENTS.md`.
 
 <!-- AUTO-GENERATED:START -->
 ### Auto-Generated Repository & Context Map
 _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit inside this block._
 
 #### Scoped `AGENTS.md` Hierarchy
-- `AGENTS.md` — Scope: Repository Root (46 lines)
-- `rules/AGENTS.md` — Scope: `rules/` (14 lines)
+- `AGENTS.md` — Scope: Repository Root (47 lines)
+- `rules/AGENTS.md` — Scope: `rules/` (16 lines)
 
 #### Active Architecture Decision Records (`docs/adr/`)
 - **`ADR-001`** (`docs/adr/001-six-pillar-zero-collateral-verification.md`) — **Six-Pillar Zero-Collateral Verification Harness** [Applies to: `*`] — Enforce PreToolUse hook-bypass blocking, cross-module AST symbol resolution, anti-test-tampering & contract compatibility checks vs HEAD, domain invariants, diff-scoped AST micro-mutation testing, and semantic drift gating using Python stdlib only.

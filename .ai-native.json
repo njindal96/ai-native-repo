@@ -6,6 +6,7 @@
   },
   "test_command": "python3 -I -m unittest discover -s tests -p 'test_*.py'",
   "enforce_contract_compatibility": true,
+  "enforce_pre_edit_context": true,
   "mutation_testing": true,
   "max_mutants": 25
 }

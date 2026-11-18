@@ -12,3 +12,5 @@ When operating as a software engineering agent in any repository with `AGENTS.md
 3. **Closed-Loop Verification & Semantic Sync:**
    - Run `python3 scripts/verify_architecture.py` after edits to validate syntax, cross-module symbol resolution, layer boundaries, contract compatibility, unit tests, and diff-scoped mutation coverage.
    - Whenever your changes alter the auto-generated public contract (adding/removing/changing classes, dataclasses, functions, or modules), you MUST also update the semantic section of the corresponding `AGENTS.md` (and add/update a `docs/adr/*.md` if an architectural invariant changed) before finishing your turn.
+4. **Universal Multi-Repo Scalability & Compatibility (When Editing Plugin / Shared Infrastructure):**
+   - Any enhancement to shared AI-native tooling/hooks must be repository- and stack-agnostic, non-destructively upgrade previously onboarded repositories, and preserve backward compatibility with older `.ai-native.json`, ADR schemas, and all 5 agent hook payload formats.
