@@ -1,18 +1,30 @@
+import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from bootstrap_repo import bootstrap_repository  # noqa: E402
-from stop_gate_hook import split_semantic_and_auto  # noqa: E402
-from sync_context import END_MARKER, START_MARKER, sync_workspace  # noqa: E402
+from bootstrap_repo import bootstrap_repository, merge_hooks_into_settings  # noqa: E402
+from pre_tool_hook import extract_command, validate_shell_command  # noqa: E402
+from stop_gate_hook import check_semantic_drift, split_semantic_and_auto  # noqa: E402
+from sync_context import (  # noqa: E402
+    END_MARKER,
+    START_MARKER,
+    adr_matches_directory,
+    inspect_polyglot_file,
+    parse_adr_frontmatter,
+    sync_workspace,
+)
 from verify_architecture import (  # noqa: E402
     check_git_head_regressions,
     check_symbol_and_dataclass_resolution,
@@ -193,7 +205,7 @@ class TestAiNativeEngine(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
             post_proc = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "post_tool_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "post_tool_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path)}),
                 text=True,
                 capture_output=True,
@@ -215,7 +227,7 @@ class TestAiNativeEngine(unittest.TestCase):
             )
 
             agy_stop = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
                 text=True,
                 capture_output=True,
@@ -226,7 +238,7 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertIn("app/services/AGENTS.md", agy_res["reason"])
 
             cc_stop = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": False}),
                 text=True,
                 capture_output=True,
@@ -244,7 +256,7 @@ class TestAiNativeEngine(unittest.TestCase):
             svc_agents.write_text(svc_text, encoding="utf-8")
 
             agy_allow = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
                 text=True,
                 capture_output=True,
@@ -253,7 +265,7 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertEqual(json.loads(agy_allow.stdout), {"decision": "allow"})
 
             cc_allow = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": False}),
                 text=True,
                 capture_output=True,
@@ -268,9 +280,8 @@ class TestAiNativeEngine(unittest.TestCase):
             _create_sample_app(tmp_path)
             bootstrap_repository(tmp_path)
 
-            # Antigravity & Claude Code --no-verify denial
             agy_deny = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
                 input=json.dumps({
                     "cwd": str(tmp_path),
                     "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit --no-verify -m x"}},
@@ -282,7 +293,7 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertEqual(json.loads(agy_deny.stdout)["decision"], "deny")
 
             cc_deny = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
                 input=json.dumps({
                     "cwd": str(tmp_path),
                     "tool_name": "Bash",
@@ -294,10 +305,9 @@ class TestAiNativeEngine(unittest.TestCase):
             )
             self.assertEqual(json.loads(cc_deny.stdout)["decision"], "block")
 
-            # Introduce failing syntax error and attempt git push -> blocked
             (tmp_path / "app" / "services" / "billing.py").write_text("def broken(:\n", encoding="utf-8")
             push_deny = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                [sys.executable, "-I", str(SCRIPTS_DIR / "pre_tool_hook.py")],
                 input=json.dumps({
                     "cwd": str(tmp_path),
                     "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
@@ -337,7 +347,6 @@ class TestAiNativeEngine(unittest.TestCase):
             subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
-            # Remove a field from Invoice dataclass and delete/weaken test_charge
             (tmp_path / "app" / "domain" / "models.py").write_text(
                 "from dataclasses import dataclass\n\n@dataclass\nclass Invoice:\n    currency: str\n",
                 encoding="utf-8",
@@ -372,7 +381,6 @@ class TestAiNativeEngine(unittest.TestCase):
             subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
 
-            # Add new function with a comparison that existing tests do NOT assert on
             billing_path = tmp_path / "app" / "services" / "billing.py"
             billing_path.write_text(
                 "from app.domain.models import Invoice\n\n"
@@ -382,12 +390,11 @@ class TestAiNativeEngine(unittest.TestCase):
                 "    return code == 'VIP'\n",
                 encoding="utf-8",
             )
-            test_cmd = "python3 -m unittest discover -s tests -p 'test_*.py'"
+            test_cmd = f"{sys.executable} -m unittest discover -s tests -p 'test_*.py'"
             mut_errs = run_diff_mutation_check(tmp_path, test_cmd)
             self.assertTrue(mut_errs)
             self.assertIn("[Weak Test / Surviving Mutant]", mut_errs[0])
 
-            # Now add real assertions killing the mutant
             test_path = tmp_path / "tests" / "test_billing.py"
             test_path.write_text(
                 test_path.read_text(encoding="utf-8")
@@ -398,6 +405,455 @@ class TestAiNativeEngine(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(run_diff_mutation_check(tmp_path, test_cmd), [])
+
+    # ------------------------------------------------------------------
+    # Silent Gaps Audit Regression Tests (GAP-01 through GAP-08)
+    # ------------------------------------------------------------------
+
+    def test_gap01_mutation_isolation_crash_safety_and_infinite_loop_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            # 1. Crash-safety & isolation: verify live working-tree bytes remain untouched even while mutant runs
+            billing_path = tmp_path / "app" / "services" / "billing.py"
+            billing_path.write_text(
+                "from app.domain.models import Invoice\n\n"
+                "def charge(inv: Invoice) -> bool:\n"
+                "    return inv.amount > 0\n\n"
+                "def spin_until(stop_flag: bool) -> int:\n"
+                "    while stop_flag == False:\n"
+                "        pass\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            orig_bytes = billing_path.read_bytes()
+            orig_sha = hashlib.sha256(orig_bytes).hexdigest()
+
+            marker_file = tmp_path / "observed_cwd.txt"
+            probe_cmd = (
+                f"{sys.executable} -c "
+                f"\"import os, pathlib, sys; "
+                f"pathlib.Path({repr(str(marker_file))}).write_text(os.getcwd()); "
+                f"sys.exit(0 if pathlib.Path({repr(str(billing_path.resolve()))}).read_bytes() == "
+                f"pathlib.Path('app/services/billing.py').read_bytes() else 1)\""
+            )
+            # If isolated properly, live file bytes STILL equal orig_bytes while tempdir file was mutated -> exit 1 (killed)
+            # Wait: also verify cwd != live workspace root!
+            run_diff_mutation_check(tmp_path, probe_cmd)
+            self.assertEqual(hashlib.sha256(billing_path.read_bytes()).hexdigest(), orig_sha)
+            self.assertNotEqual(Path(marker_file.read_text()).resolve(), tmp_path.resolve())
+
+            # 2. Infinite loop mutant timeout: spin_until(True) passes normally, loops forever when == becomes !=
+            test_path = tmp_path / "tests" / "test_billing.py"
+            test_path.write_text(
+                test_path.read_text(encoding="utf-8")
+                + "    def test_spin(self):\n"
+                + "        from app.services.billing import spin_until\n"
+                + "        self.assertEqual(spin_until(True), 1)\n",
+                encoding="utf-8",
+            )
+            test_cmd = f"{sys.executable} -m unittest discover -s tests -p 'test_*.py'"
+            timeout_errs = run_diff_mutation_check(tmp_path, test_cmd, timeout_sec=0.5)
+            self.assertEqual(timeout_errs, [])
+            self.assertEqual(hashlib.sha256(billing_path.read_bytes()).hexdigest(), orig_sha)
+
+            # 3. Configurable max_mutants cap (commit spin_until, then add untested comparisons)
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "spin"], cwd=str(tmp_path), check=True, capture_output=True)
+            billing_path.write_text(
+                billing_path.read_text(encoding="utf-8")
+                + "\ndef many_cmp(a, b, c, d):\n"
+                + "    return (a == 1) and (b == 2) and (c == 3) and (d == 4)\n",
+                encoding="utf-8",
+            )
+            capped = run_diff_mutation_check(tmp_path, test_cmd, max_mutants=2, timeout_sec=1.0)
+            self.assertEqual(len(capped), 2)
+            cfg_path = tmp_path / ".ai-native.json"
+            cfg_obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg_obj["max_mutants"] = 2
+            cfg_obj["mutation_testing"] = True
+            cfg_path.write_text(json.dumps(cfg_obj, indent=2), encoding="utf-8")
+            via_verify = verify_workspace(tmp_path, run_tests=True)
+            self.assertEqual(sum(1 for e in via_verify if "[Weak Test / Surviving Mutant]" in e), 2)
+
+    def test_gap02_pre_tool_shell_gate_bypasses_and_config_tampering(self):
+        bypass_commands = [
+            'git commit -n -m "msg"',
+            'git commit -am "msg" -n',
+            'git commit -amn "msg"',
+            'git commit -anm "msg"',
+            'git commit --no-verify -m "msg"',
+            'true && git commit -n -m "bypass"',
+            'git -c core.hooksPath=/dev/null commit -m "bypass"',
+            'git -ccore.hooksPath=/dev/null push origin main',
+            'git config core.hooksPath /dev/null',
+            'git push --no-verify origin main',
+            'git merge -n feature-branch',
+            'git cherry-pick --no-verify abc1234',
+            'git rebase --no-verify main',
+            'chmod -x .githooks/pre-commit',
+            'chmod 644 .githooks/pre-push',
+            'rm -rf .githooks',
+        ]
+        for cmd in bypass_commands:
+            with self.subTest(blocked=cmd):
+                reason, _ = validate_shell_command(cmd)
+                self.assertIsNotNone(reason, f"Expected bypass command to be BLOCKED: {cmd}")
+
+        valid_commands = [
+            'git commit -m "fix -n flag and --no-verify handling"',
+            'git commit -am "document -n behavior"',
+            'git commit -m"done with -n spacing"',
+            'git clean -n',
+            'git clean -nd',
+            'git log -n 5',
+            'git status && git diff',
+            'chmod +x .githooks/pre-commit',
+        ]
+        for cmd in valid_commands:
+            with self.subTest(allowed=cmd):
+                reason, _ = validate_shell_command(cmd)
+                self.assertIsNone(reason, f"Expected legitimate command to be ALLOWED: {cmd} -> {reason}")
+
+        # Also verify check_git_head_regressions catches .ai-native.json weakening & .githooks tampering
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            cfg = {
+                "version": "3.0",
+                "context_budget": {"max_lines": 200, "max_bytes": 20000},
+                "test_command": "",
+                "enforce_contract_compatibility": True,
+                "mutation_testing": True,
+                "max_layers_touched": 1,
+                "layers": [{"path": "app/domain", "forbidden_imports": ["requests"]}],
+            }
+            (tmp_path / ".ai-native.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            weak_cfg = {
+                "version": "3.0",
+                "context_budget": {"max_lines": 500, "max_bytes": 20000},
+                "test_command": "",
+                "enforce_contract_compatibility": False,
+                "mutation_testing": False,
+                "max_layers_touched": 5,
+                "layers": [{"path": "app/domain", "forbidden_imports": []}],
+            }
+            (tmp_path / ".ai-native.json").write_text(json.dumps(weak_cfg, indent=2), encoding="utf-8")
+            (tmp_path / ".githooks" / "pre-commit").chmod(0o644)
+
+            errs = check_git_head_regressions(tmp_path, weak_cfg)
+            joined = "\n".join(errs)
+            self.assertIn("[Guardrail Tampering Blocked]", joined)
+            self.assertIn("mutation_testing", joined)
+            self.assertIn("enforce_contract_compatibility", joined)
+            self.assertIn("forbidden_imports", joined)
+            self.assertIn("pre-commit", joined)
+
+    def test_gap03_polyglot_comment_stripping_multiline_and_boundary_linting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            web_dir = tmp_path / "web" / "domain"
+            web_dir.mkdir(parents=True)
+            (web_dir / "AGENTS.md").write_text(f"# Web\n\n{START_MARKER}\n{END_MARKER}\n", encoding="utf-8")
+            (tmp_path / "AGENTS.md").write_text(f"# Root\n\n{START_MARKER}\n{END_MARKER}\n", encoding="utf-8")
+
+            ts_file = web_dir / "order.ts"
+            ts_file.write_text(
+                '/*\n * export function fakeCommentedOut() {}\n */\n'
+                '// export const fakeSingleLine = 1;\n'
+                'const strSample = "export class FakeInString {}";\n'
+                '// import { readFile } from "fs";\n'
+                'import axios from "axios";\n'
+                'export async function fetchOrder<\n'
+                '  T extends { id: string }\n'
+                '>(\n'
+                '  id: string\n'
+                '): Promise<T> {\n'
+                '  return {} as T;\n'
+                '}\n'
+                'export {\n  OrderId,\n  OrderStatus as StatusType\n};\n',
+                encoding="utf-8",
+            )
+            (web_dir / "worker.go").write_text(
+                'package domain\n/* func FakeGo() {} */\n// type FakeType struct {}\nfunc ProcessOrder(id string) {}\ntype OrderConfig struct {}\n',
+                encoding="utf-8",
+            )
+            (web_dir / "lib.rs").write_text(
+                '// pub fn fake_rust() {}\npub async fn execute_trade() {}\npub struct TradeBook {}\n',
+                encoding="utf-8",
+            )
+            (web_dir / "Gateway.java").write_text(
+                '/* public class FakeJava {} */\npublic class PaymentGateway {}\n',
+                encoding="utf-8",
+            )
+
+            ts_exports = inspect_polyglot_file(ts_file, tmp_path)["exports"]
+            self.assertEqual(ts_exports, ["fetchOrder", "OrderId", "StatusType"])
+            self.assertEqual(inspect_polyglot_file(web_dir / "worker.go", tmp_path)["exports"], ["ProcessOrder", "OrderConfig"])
+            self.assertEqual(inspect_polyglot_file(web_dir / "lib.rs", tmp_path)["exports"], ["execute_trade", "TradeBook"])
+            self.assertEqual(inspect_polyglot_file(web_dir / "Gateway.java", tmp_path)["exports"], ["PaymentGateway"])
+
+            (tmp_path / ".ai-native.json").write_text(
+                json.dumps({
+                    "version": "3.0",
+                    "layers": [{"path": "web/domain", "forbidden_imports": ["fs", "axios"]}],
+                }),
+                encoding="utf-8",
+            )
+            sync_workspace(tmp_path)
+            errs = verify_workspace(tmp_path, run_tests=False)
+            joined = "\n".join(errs)
+            self.assertIn("axios", joined)
+            self.assertNotIn("fs", joined)
+
+    def test_gap04_python_resolver_inheritance_init_false_relative_imports_reexports_and_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            domain_dir = tmp_path / "app" / "domain"
+            services_dir = tmp_path / "app" / "services"
+            domain_dir.mkdir(parents=True)
+            services_dir.mkdir(parents=True)
+            (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+            (domain_dir / "__init__.py").write_text("from .models import Child\n", encoding="utf-8")
+            (services_dir / "__init__.py").write_text("", encoding="utf-8")
+
+            (domain_dir / "models.py").write_text(
+                "from dataclasses import dataclass, field, KW_ONLY\n"
+                "from external_pkg import ExternalBase\n\n"
+                "@dataclass\n"
+                "class Base:\n"
+                "    base_id: int\n\n"
+                "@dataclass\n"
+                "class Child(Base):\n"
+                "    _: KW_ONLY\n"
+                "    tag: str = 'ok'\n"
+                "    computed: int = field(init=False, default=1)\n\n"
+                "@dataclass\n"
+                "class ExtChild(ExternalBase):\n"
+                "    local_field: str\n",
+                encoding="utf-8",
+            )
+
+            # Valid usage via __init__.py re-export, relative import, inherited base_id, external base
+            (services_dir / "good.py").write_text(
+                "from ..domain import Child\n"
+                "from ..domain.models import ExtChild\n"
+                "import app.domain.models as dm\n\n"
+                "def ok():\n"
+                "    c1 = Child(base_id=1, tag='a')\n"
+                "    c2 = dm.Child(base_id=2)\n"
+                "    e = ExtChild(local_field='x', parent_ext_kw=99)\n"
+                "    return (c1, c2, e)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_symbol_and_dataclass_resolution(tmp_path), [])
+
+            # Invalid usages: init=False field passed, relative hallucinated import, module alias nonexistent fn
+            (services_dir / "bad.py").write_text(
+                "from ..domain import Child, MissingExport\n"
+                "import app.domain.models as dm\n\n"
+                "def broken():\n"
+                "    dm.does_not_exist()\n"
+                "    Child(base_id=1, computed=99)\n"
+                "    return Child(base_id=1, bogus=2)\n",
+                encoding="utf-8",
+            )
+            errs = check_symbol_and_dataclass_resolution(tmp_path)
+            joined = "\n".join(errs)
+            self.assertIn("[Hallucinated Import]", joined)
+            self.assertIn("MissingExport", joined)
+            self.assertIn("[Hallucinated Symbol]", joined)
+            self.assertIn("dm.does_not_exist", joined)
+            self.assertIn("computed", joined)
+            self.assertIn("bogus", joined)
+
+    def test_gap05_adr_frontmatter_crlf_body_dividers_colons_and_lists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            adr_dir = tmp_path / "docs" / "adr"
+            adr_dir.mkdir(parents=True)
+
+            block_adr = adr_dir / "002-crlf.md"
+            block_adr.write_bytes(
+                b"---\r\n"
+                b"id: ADR-002\r\n"
+                b'title: "ADR-02: Retry Policy: Strict"\r\n'
+                b"status: accepted\r\n"
+                b"applies_to:\r\n"
+                b"  - app/domain/*\r\n"
+                b"  - app/services/*\r\n"
+                b'summary: "Retries: must be idempotent"\r\n'
+                b"---\r\n"
+                b"# Body\r\n"
+                b"---\r\n"
+                b"title: Fake Body Divider Title\r\n"
+                b"---\r\n"
+            )
+            meta = parse_adr_frontmatter(block_adr, tmp_path)
+            self.assertEqual(meta["id"], "ADR-002")
+            self.assertEqual(meta["title"], "ADR-02: Retry Policy: Strict")
+            self.assertEqual(meta["summary"], "Retries: must be idempotent")
+            self.assertEqual(meta["applies_to_list"], ["app/domain/*", "app/services/*"])
+            self.assertTrue(adr_matches_directory(meta, "app/domain"))
+            self.assertTrue(adr_matches_directory(meta, "app/services"))
+            self.assertFalse(adr_matches_directory(meta, "app/ui"))
+
+            inline_adr = adr_dir / "003-inline.md"
+            inline_adr.write_text(
+                "---\nid: ADR-003\napplies_to: [app/api/*, 'app/workers/*']\nsummary: API & Workers\n---\n\nText\n---\nMore\n",
+                encoding="utf-8",
+            )
+            meta3 = parse_adr_frontmatter(inline_adr, tmp_path)
+            self.assertEqual(meta3["applies_to_list"], ["app/api/*", "app/workers/*"])
+            self.assertTrue(adr_matches_directory(meta3, "app/workers"))
+            self.assertFalse(adr_matches_directory(meta3, "app/domain"))
+
+    def test_gap06_stop_gate_whitespace_bypass_private_edits_and_reentry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            # (a) Private helper edit only -> must NOT trigger semantic drift refusal
+            billing_path = tmp_path / "app" / "services" / "billing.py"
+            orig_billing = billing_path.read_text(encoding="utf-8")
+            billing_path.write_text(orig_billing + "\ndef _private_helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+            allow_private = subprocess.run(
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(allow_private.stdout), {"decision": "allow"})
+
+            # (b) Public contract change + whitespace-only edit in AGENTS.md -> MUST still block
+            billing_path.write_text(
+                orig_billing + "\ndef issue_credit(inv_id: str) -> bool:\n    return len(inv_id) > 0\n",
+                encoding="utf-8",
+            )
+            test_path = tmp_path / "tests" / "test_billing.py"
+            test_path.write_text(
+                test_path.read_text(encoding="utf-8")
+                + "    def test_issue_credit(self):\n"
+                + "        from app.services.billing import issue_credit\n"
+                + "        self.assertTrue(issue_credit('A'))\n"
+                + "        self.assertFalse(issue_credit(''))\n",
+                encoding="utf-8",
+            )
+            svc_agents = tmp_path / "app" / "services" / "AGENTS.md"
+            svc_agents.write_text(
+                svc_agents.read_text(encoding="utf-8").replace("## Purpose & Invariants\n", "## Purpose & Invariants\n\n   \n"),
+                encoding="utf-8",
+            )
+            sync_workspace(tmp_path)
+            drifted = check_semantic_drift(tmp_path)
+            self.assertTrue(drifted)
+            self.assertIn("app/services/AGENTS.md", drifted[0])
+            self.assertIn("issue_credit", drifted[0])
+
+            # (c) Re-entry flags must exit cleanly to prevent infinite refusal loop
+            cc_reentry = subprocess.run(
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": True}),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(cc_reentry.stdout), {})
+
+            agy_reentry = subprocess.run(
+                [sys.executable, "-I", str(SCRIPTS_DIR / "stop_gate_hook.py")],
+                input=json.dumps({"cwd": str(tmp_path), "continuationActive": True, "terminationReason": "NO_TOOL_CALL"}),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(agy_reentry.stdout), {"decision": "allow"})
+
+    def test_gap07_non_destructive_onboarding_preserves_existing_hooks_claude_md_and_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+
+            # Pre-existing custom .git/hooks/pre-commit and custom CLAUDE.md
+            ran_marker = tmp_path / "legacy_hook_ran.txt"
+            old_hook = tmp_path / ".git" / "hooks" / "pre-commit"
+            old_hook.write_text(f"#!/usr/bin/env sh\ntouch {ran_marker}\n", encoding="utf-8")
+            old_hook.chmod(0o755)
+            (tmp_path / "CLAUDE.md").write_text("# Legacy Rules\nAlways validate tax_id before charge().\n", encoding="utf-8")
+
+            actions = bootstrap_repository(tmp_path)
+            joined_actions = "\n".join(actions)
+            self.assertIn("Merged existing CLAUDE.md into AGENTS.md", joined_actions)
+            self.assertIn("pre-commit.local", joined_actions)
+            self.assertIn("Always validate tax_id before charge().", (tmp_path / "AGENTS.md").read_text(encoding="utf-8"))
+
+            local_hook = tmp_path / ".githooks" / "pre-commit.local"
+            self.assertTrue(local_hook.exists())
+            subprocess.run(["sh", str(tmp_path / ".githooks" / "pre-commit")], cwd=str(tmp_path), check=True, capture_output=True)
+            self.assertTrue(ran_marker.exists(), "Pre-existing pre-commit hook was not chained!")
+
+            # Test Windows symlink OSError fallback
+            win_path = tmp_path / "win_fallback"
+            win_path.mkdir()
+            (win_path / "AGENTS.md").write_text("# Win\n", encoding="utf-8")
+            with mock.patch("pathlib.Path.symlink_to", side_effect=OSError("WinError 1314")):
+                bootstrap_repository(win_path)
+            self.assertTrue((win_path / "CLAUDE.md").exists())
+            self.assertFalse((win_path / "CLAUDE.md").is_symlink())
+
+            # Test non-destructive JSON settings merger
+            settings_path = tmp_path / "settings.json"
+            settings_path.write_text(json.dumps({
+                "model": "custom-model",
+                "hooks": {"PreToolUse": [{"matcher": "CustomTool", "hooks": []}]},
+            }), encoding="utf-8")
+            self.assertTrue(merge_hooks_into_settings(settings_path))
+            self.assertFalse(merge_hooks_into_settings(settings_path))  # idempotent second pass
+            merged = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(merged["model"], "custom-model")
+            self.assertEqual(len(merged["hooks"]["PreToolUse"]), 2)
+            self.assertIn("PostToolUse", merged["hooks"])
+            self.assertIn("Stop", merged["hooks"])
+
+    def test_gap08_multi_agent_hook_payload_resilience(self):
+        payloads = [
+            "",
+            "null",
+            "[1, 2, 3]",
+            "{broken-json",
+            json.dumps({"cwd": "/nonexistent", "tool_name": "Bash", "tool_input": "not-a-dict"}),
+            json.dumps({"cwd": "/nonexistent", "tool_name": "run_shell_command", "tool_input": {"command": "echo hi"}}),
+            json.dumps({"workspacePaths": "invalid-string", "toolCall": {"name": "run_command", "args": {"CommandLine": "echo hi"}}}),
+        ]
+        for script_name in ("pre_tool_hook.py", "post_tool_hook.py", "stop_gate_hook.py"):
+            script_path = SCRIPTS_DIR / script_name
+            for raw_in in payloads:
+                with self.subTest(script=script_name, payload=raw_in):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", str(script_path)],
+                        input=raw_in,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{script_name} crashed on {raw_in!r}: {proc.stderr}")
+                    parsed = json.loads(proc.stdout)
+                    self.assertIsInstance(parsed, dict)
 
 
 if __name__ == "__main__":

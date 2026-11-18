@@ -9,16 +9,24 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
-      - name: Sync & Verify AI-Native Architecture
+      - name: Run Isolated Stdlib-Only Test Suite
+        run: python3 -I -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Sync & Verify AI-Native Architecture (Dogfooding)
         run: |
           python3 scripts/sync_context.py
           python3 scripts/verify_architecture.py
