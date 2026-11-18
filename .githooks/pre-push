@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -e
+HOOK_LOCAL="$(dirname "$0")/pre-push.local"
+if [ -x "$HOOK_LOCAL" ]; then
+  "$HOOK_LOCAL" "$@"
+fi
+python3 scripts/verify_architecture.py

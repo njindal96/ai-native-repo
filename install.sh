@@ -23,6 +23,10 @@ if [ "${1:-}" = "--init" ] && [ -n "${2:-}" ]; then
   TARGET_REPO="$2"
   echo "==> Bootstrapping repository: $TARGET_REPO"
   python3 "$PLUGIN_DIR/scripts/bootstrap_repo.py" --workspace "$TARGET_REPO"
+elif [ "${1:-}" = "--merge-settings" ] && [ -n "${2:-}" ]; then
+  SETTINGS_JSON="$2"
+  echo "==> Non-destructively merging hooks into: $SETTINGS_JSON"
+  python3 "$PLUGIN_DIR/scripts/bootstrap_repo.py" --merge-settings "$SETTINGS_JSON"
 fi
 
 echo "==> Done! Open any project in Antigravity (or run: python3 $PLUGIN_DIR/scripts/bootstrap_repo.py --workspace /path/to/repo)."

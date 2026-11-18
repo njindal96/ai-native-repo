@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 """
-Automated 1-Command Repository Bootstrapper for AI-Native Repositories.
-Scaffolds (non-destructively):
-1. .ai-native.json (auto-detecting layers and test commands if not present)
-2. Root AGENTS.md + scoped sub-directory AGENTS.md files (with AUTO-GENERATED markers)
-3. CLAUDE.md -> AGENTS.md symlink
-4. docs/adr/001-ai-native-architecture.md (if docs/adr/ does not exist)
-5. scripts/sync_context.py and scripts/verify_architecture.py
-6. .githooks/pre-commit + git config core.hooksPath .githooks
-7. Runs initial sync_context.py and verify_architecture.py
+Automated 1-Command Repository Bootstrapper for AI-Native Repositories (v3.1).
+Scaffolds cleanly and non-destructively:
+1. Copies sync_context.py and verify_architecture.py into scripts/
+2. Creates .ai-native.json (auto-detecting Python & polyglot layers + test command)
+3. Initializes root AGENTS.md and scoped */AGENTS.md files, merging any pre-existing CLAUDE.md
+4. Creates CLAUDE.md -> AGENTS.md symlink (with Windows-safe copy fallback on OSError)
+5. Scaffolds starter docs/adr/001-ai-native-architecture.md if missing
+6. Preserves & chains pre-existing .git/hooks/* or custom core.hooksPath hooks to .githooks/*.local
+7. Supports non-destructive JSON hook merging via merge_hooks_into_settings()
 """
+from __future__ import annotations
+
 import argparse
 import json
+import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
-from sync_context import END_MARKER, IGNORE_DIRS, START_MARKER, sync_workspace
-from verify_architecture import verify_workspace
+from typing import Optional
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from sync_context import (  # noqa: E402
+    END_MARKER,
+    IGNORE_DIRS,
+    POLYGLOT_EXTENSIONS,
+    START_MARKER,
+    sync_workspace,
+)
+from verify_architecture import verify_workspace  # noqa: E402
 
 PLUGIN_SCRIPTS_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT_DIR = PLUGIN_SCRIPTS_DIR.parent
+ALL_CODE_EXTENSIONS = {".py"} | POLYGLOT_EXTENSIONS
 
 
 def make_executable(path: Path):
@@ -28,21 +46,28 @@ def make_executable(path: Path):
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _has_source_files(directory: Path) -> bool:
+    for p in directory.rglob("*"):
+        if p.is_file() and p.suffix.lower() in ALL_CODE_EXTENSIONS:
+            if not any(part in IGNORE_DIRS for part in p.relative_to(directory).parts):
+                return True
+    return False
+
+
 def detect_code_layers(repo_root: Path) -> list[dict]:
     layers = []
     candidates = []
+    skip_top = IGNORE_DIRS | {"scripts", "tests", "docs", ".github", "skills", "rules", "assets"}
     for child in sorted(repo_root.iterdir()):
-        if not child.is_dir() or child.name in IGNORE_DIRS or child.name in {
-            "scripts", "tests", "docs", ".github", "skills", "rules", "assets"
-        }:
+        if not child.is_dir() or child.name in skip_top:
             continue
         subdirs = [
             d for d in sorted(child.iterdir())
-            if d.is_dir() and d.name not in IGNORE_DIRS and (any(d.rglob("*.py")) or any(d.rglob("*.ts*")))
+            if d.is_dir() and d.name not in IGNORE_DIRS and _has_source_files(d)
         ]
         if subdirs:
             candidates.extend(subdirs)
-        elif any(child.rglob("*.py")) or any(child.rglob("*.ts*")):
+        elif _has_source_files(child):
             candidates.append(child)
 
     for c in candidates:
@@ -50,7 +75,7 @@ def detect_code_layers(repo_root: Path) -> list[dict]:
         layers.append({
             "path": rel,
             "forbidden_imports": [],
-            "reason": f"Layer boundary for {rel}"
+            "reason": f"Layer boundary for {rel}",
         })
     return layers
 
@@ -102,6 +127,186 @@ def ensure_markers_in_agents_md(agents_path: Path, title: str, is_root: bool) ->
     return False
 
 
+def _merge_claude_md_into_agents_md(repo_root: Path) -> Optional[str]:
+    claude_md = repo_root / "CLAUDE.md"
+    agents_md = repo_root / "AGENTS.md"
+    merged_note: Optional[str] = None
+
+    if claude_md.exists() and not claude_md.is_symlink():
+        existing_claude = claude_md.read_text(encoding="utf-8").strip()
+        agents_text = agents_md.read_text(encoding="utf-8")
+        if existing_claude and existing_claude not in agents_text:
+            section = f"## Project Context (Merged from CLAUDE.md)\n\n{existing_claude}\n\n"
+            start_m = re.search(rf"^[ \t]*{re.escape(START_MARKER)}[ \t]*$", agents_text, re.M)
+            if start_m:
+                updated = agents_text[:start_m.start()] + section + agents_text[start_m.start():]
+            else:
+                updated = agents_text.rstrip() + "\n\n" + section
+            agents_md.write_text(updated, encoding="utf-8")
+            merged_note = "Merged existing CLAUDE.md into AGENTS.md"
+        claude_md.unlink()
+
+    if not claude_md.exists() and not claude_md.is_symlink():
+        try:
+            claude_md.symlink_to("AGENTS.md")
+            return merged_note or "Created CLAUDE.md -> AGENTS.md symlink"
+        except OSError:
+            shutil.copy2(agents_md, claude_md)
+            return merged_note or "Copied AGENTS.md to CLAUDE.md (symlink unsupported fallback)"
+    return merged_note
+
+
+def _install_git_hooks_non_destructive(repo_root: Path) -> list[str]:
+    actions: list[str] = []
+    githooks_dir = repo_root / ".githooks"
+    githooks_dir.mkdir(parents=True, exist_ok=True)
+    has_git = (repo_root / ".git").exists()
+
+    old_hooks_dir: Optional[Path] = None
+    if has_git:
+        proc = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+        raw_hp = proc.stdout.strip()
+        if proc.returncode == 0 and raw_hp and raw_hp.rstrip("/") not in (".githooks", "./.githooks"):
+            cand = Path(raw_hp)
+            old_hooks_dir = cand if cand.is_absolute() else (repo_root / cand)
+
+    for hook_name, body_lines in (
+        (
+            "pre-commit",
+            [
+                "python3 scripts/sync_context.py",
+                "python3 scripts/verify_architecture.py",
+                "git add AGENTS.md */AGENTS.md **/AGENTS.md 2>/dev/null || true",
+            ],
+        ),
+        (
+            "pre-push",
+            [
+                "python3 scripts/verify_architecture.py",
+            ],
+        ),
+    ):
+        target_hook = githooks_dir / hook_name
+        local_hook = githooks_dir / f"{hook_name}.local"
+
+        if not local_hook.exists():
+            candidates = []
+            if old_hooks_dir is not None:
+                candidates.append(old_hooks_dir / hook_name)
+            if has_git:
+                candidates.append(repo_root / ".git" / "hooks" / hook_name)
+            if target_hook.exists():
+                candidates.append(target_hook)
+
+            for src_hook in candidates:
+                if src_hook.is_file():
+                    try:
+                        text = src_hook.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        text = ""
+                    if "verify_architecture.py" not in text:
+                        shutil.copy2(src_hook, local_hook)
+                        make_executable(local_hook)
+                        actions.append(f"Preserved existing {hook_name} hook to .githooks/{hook_name}.local")
+                        if src_hook == target_hook:
+                            target_hook.unlink()
+                        break
+
+        if not target_hook.exists():
+            hook_script = (
+                "#!/usr/bin/env sh\n"
+                "set -e\n"
+                f'HOOK_LOCAL="$(dirname "$0")/{hook_name}.local"\n'
+                'if [ -x "$HOOK_LOCAL" ]; then\n'
+                '  "$HOOK_LOCAL" "$@"\n'
+                "fi\n"
+                + "\n".join(body_lines)
+                + "\n"
+            )
+            target_hook.write_text(hook_script, encoding="utf-8")
+            make_executable(target_hook)
+            actions.append(f"Created .githooks/{hook_name}")
+
+    if has_git:
+        subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=str(repo_root), check=False)
+
+    return actions
+
+
+def merge_hooks_into_settings(settings_path: Path, plugin_dir: Optional[Path] = None) -> bool:
+    """
+    Non-destructively merge ai-native-repo hooks into an existing JSON settings file
+    (e.g., Claude Code ~/.claude/settings.json or Antigravity hooks config) without
+    overwriting pre-existing keys or user hooks.
+    """
+    p_dir = (plugin_dir or PLUGIN_ROOT_DIR).resolve()
+    data: dict = {}
+    if settings_path.exists():
+        raw = settings_path.read_text(encoding="utf-8").strip()
+        if raw:
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{settings_path} must contain a top-level JSON object.")
+            data = loaded
+
+    hooks_section = data.setdefault("hooks", {})
+    if not isinstance(hooks_section, dict):
+        raise ValueError(f"{settings_path} 'hooks' field must be a JSON object.")
+
+    desired = {
+        "PreToolUse": {
+            "matcher": "run_command|Bash|run_shell_command|bash|shell|execute_command|terminal",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"python3 {p_dir / 'scripts' / 'pre_tool_hook.py'}",
+                    "timeout": 15,
+                }
+            ],
+        },
+        "PostToolUse": {
+            "matcher": "write_file|edit_file|run_command|Write|Edit|MultiEdit|Bash|run_shell_command",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"python3 {p_dir / 'scripts' / 'post_tool_hook.py'}",
+                    "timeout": 10,
+                }
+            ],
+        },
+        "Stop": {
+            "type": "command",
+            "command": f"python3 {p_dir / 'scripts' / 'stop_gate_hook.py'}",
+            "timeout": 15,
+        },
+    }
+
+    changed = False
+    for event, entry in desired.items():
+        lst = hooks_section.setdefault(event, [])
+        if not isinstance(lst, list):
+            continue
+        target_cmd = (
+            entry["command"]
+            if "command" in entry
+            else entry["hooks"][0]["command"]
+        )
+        serialized = json.dumps(lst)
+        if os.path.basename(target_cmd.split()[-1]) not in serialized:
+            lst.append(entry)
+            changed = True
+
+    if changed or not settings_path.exists():
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
 def bootstrap_repository(repo_root: Path) -> list[str]:
     actions = []
     repo_root = repo_root.resolve()
@@ -127,6 +332,7 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             "test_command": detect_test_command(repo_root),
             "enforce_contract_compatibility": True,
             "mutation_testing": True,
+            "max_mutants": 25,
             "layers": layers,
         }
         config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
@@ -148,11 +354,10 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             if ensure_markers_in_agents_md(l_path / "AGENTS.md", layer["path"], is_root=False):
                 actions.append(f"Initialized {layer['path']}/AGENTS.md")
 
-    # 4. Ensure CLAUDE.md -> AGENTS.md symlink
-    claude_md = repo_root / "CLAUDE.md"
-    if not claude_md.exists() and not claude_md.is_symlink():
-        claude_md.symlink_to("AGENTS.md")
-        actions.append("Created CLAUDE.md -> AGENTS.md symlink")
+    # 4. Merge any existing CLAUDE.md and link CLAUDE.md -> AGENTS.md safely
+    claude_action = _merge_claude_md_into_agents_md(repo_root)
+    if claude_action:
+        actions.append(claude_action)
 
     # 5. Ensure docs/adr/ exists with at least one starter ADR if missing
     adr_dir = repo_root / "docs" / "adr"
@@ -173,35 +378,8 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
         )
         actions.append("Created docs/adr/001-ai-native-architecture.md")
 
-    # 6. Install .githooks/pre-commit and configure git hooksPath
-    githooks_dir = repo_root / ".githooks"
-    githooks_dir.mkdir(parents=True, exist_ok=True)
-    pre_commit = githooks_dir / "pre-commit"
-    if not pre_commit.exists():
-        pre_commit.write_text(
-            "#!/usr/bin/env sh\n"
-            "set -e\n"
-            "python3 scripts/sync_context.py\n"
-            "python3 scripts/verify_architecture.py\n"
-            "git add AGENTS.md */AGENTS.md **/AGENTS.md 2>/dev/null || true\n",
-            encoding="utf-8",
-        )
-        make_executable(pre_commit)
-        actions.append("Created .githooks/pre-commit")
-
-    pre_push = githooks_dir / "pre-push"
-    if not pre_push.exists():
-        pre_push.write_text(
-            "#!/usr/bin/env sh\n"
-            "set -e\n"
-            "python3 scripts/verify_architecture.py\n",
-            encoding="utf-8",
-        )
-        make_executable(pre_push)
-        actions.append("Created .githooks/pre-push")
-
-    if (repo_root / ".git").exists():
-        subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=str(repo_root), check=False)
+    # 6. Install .githooks/pre-commit & pre-push while preserving pre-existing hooks
+    actions.extend(_install_git_hooks_non_destructive(repo_root))
 
     # 7. Sync all AGENTS.md files
     sync_workspace(repo_root)
@@ -209,9 +387,17 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bootstrap a repository with AI-Native v2.0 structure and hooks.")
+    parser = argparse.ArgumentParser(description="Bootstrap a repository with AI-Native v3.1 structure and hooks.")
     parser.add_argument("--workspace", default=".", help="Target repository root")
+    parser.add_argument("--merge-settings", default="", help="Optional JSON settings file to merge plugin hooks into")
     args = parser.parse_args()
+
+    if args.merge_settings:
+        settings_path = Path(args.merge_settings).expanduser().resolve()
+        merged = merge_hooks_into_settings(settings_path)
+        print(f"[ai-native-repo] {'Merged' if merged else 'Hooks already present in'} {settings_path}")
+        return
+
     target = Path(args.workspace).resolve()
     actions = bootstrap_repository(target)
     if actions:

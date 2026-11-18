@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -e
+HOOK_LOCAL="$(dirname "$0")/pre-commit.local"
+if [ -x "$HOOK_LOCAL" ]; then
+  "$HOOK_LOCAL" "$@"
+fi
+python3 scripts/sync_context.py
+python3 scripts/verify_architecture.py
+git add AGENTS.md */AGENTS.md **/AGENTS.md 2>/dev/null || true

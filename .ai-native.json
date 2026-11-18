@@ -1,8 +1,11 @@
 {
-  "version": "2.0",
+  "version": "3.0",
   "context_budget": {
     "max_lines": 200,
     "max_bytes": 20000
   },
-  "test_command": "python3 -m unittest discover -s tests -p 'test_*.py'"
+  "test_command": "python3 -I -m unittest discover -s tests -p 'test_*.py'",
+  "enforce_contract_compatibility": true,
+  "mutation_testing": true,
+  "max_mutants": 25
 }
