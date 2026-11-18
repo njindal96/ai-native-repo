@@ -855,6 +855,10 @@ class TestAiNativeEngine(unittest.TestCase):
                     parsed = json.loads(proc.stdout)
                     self.assertIsInstance(parsed, dict)
 
+        hooks_cfg = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))["ai-native-auto-sync"]
+        self.assertGreaterEqual(hooks_cfg["PreToolUse"][0]["hooks"][0]["timeout"], 60)
+        self.assertGreaterEqual(hooks_cfg["Stop"][0]["timeout"], 60)
+
 
 if __name__ == "__main__":
     unittest.main()
