@@ -1,8 +1,8 @@
 {
   "name": "ai-native-repo",
   "displayName": "AI-Native Repo Context & Guardrails Engine",
-  "version": "2.0.0",
-  "description": "Self-updating polyglot AGENTS.md contracts, AST layer-boundary enforcement, machine-readable ADR routing, automated repo bootstrapping, and lifecycle hooks for autonomous coding agents.",
+  "version": "3.0.0",
+  "description": "Self-updating polyglot AGENTS.md contracts, AST layer-boundary & anti-hallucination verifier, anti-test-tampering & diff-mutation gates, ADR routing, and cross-agent lifecycle hooks.",
   "author": {
     "name": "Naman Jindal",
     "url": "https://github.com/njindal96"
@@ -10,8 +10,8 @@
   "homepage": "https://github.com/njindal96/ai-native-repo",
   "repository": "https://github.com/njindal96/ai-native-repo",
   "suggestedPrompts": [
-    "Bootstrap this repository with AI-native AGENTS.md contracts, ADR routing, and Git hooks",
-    "Run AI-native architecture verification and sync all AGENTS.md contracts",
+    "Bootstrap this repository with AI-native AGENTS.md contracts, ADR routing, and v3.0 zero-collateral verification hooks",
+    "Run AI-native architecture, anti-regression, and diff-mutation verification",
     "Create a machine-readable ADR for a new architectural decision"
   ]
 }

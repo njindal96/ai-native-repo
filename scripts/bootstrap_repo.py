@@ -122,9 +122,11 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
     layers = detect_code_layers(repo_root)
     if not config_path.exists():
         cfg = {
-            "version": "2.0",
+            "version": "3.0",
             "context_budget": {"max_lines": 200, "max_bytes": 20000},
             "test_command": detect_test_command(repo_root),
+            "enforce_contract_compatibility": True,
+            "mutation_testing": True,
             "layers": layers,
         }
         config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
@@ -186,6 +188,17 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
         )
         make_executable(pre_commit)
         actions.append("Created .githooks/pre-commit")
+
+    pre_push = githooks_dir / "pre-push"
+    if not pre_push.exists():
+        pre_push.write_text(
+            "#!/usr/bin/env sh\n"
+            "set -e\n"
+            "python3 scripts/verify_architecture.py\n",
+            encoding="utf-8",
+        )
+        make_executable(pre_push)
+        actions.append("Created .githooks/pre-push")
 
     if (repo_root / ".git").exists():
         subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=str(repo_root), check=False)

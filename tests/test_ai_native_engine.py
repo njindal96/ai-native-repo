@@ -13,7 +13,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 from bootstrap_repo import bootstrap_repository  # noqa: E402
 from stop_gate_hook import split_semantic_and_auto  # noqa: E402
 from sync_context import END_MARKER, START_MARKER, sync_workspace  # noqa: E402
-from verify_architecture import verify_workspace  # noqa: E402
+from verify_architecture import (  # noqa: E402
+    check_git_head_regressions,
+    check_symbol_and_dataclass_resolution,
+    run_diff_mutation_check,
+    verify_workspace,
+)
 
 
 def _init_git_repo(root: Path):
@@ -25,8 +30,10 @@ def _init_git_repo(root: Path):
 def _create_sample_app(root: Path):
     domain_dir = root / "app" / "domain"
     services_dir = root / "app" / "services"
+    tests_dir = root / "tests"
     domain_dir.mkdir(parents=True, exist_ok=True)
     services_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.mkdir(parents=True, exist_ok=True)
     (root / "app" / "__init__.py").write_text("", encoding="utf-8")
     (domain_dir / "__init__.py").write_text("", encoding="utf-8")
     (services_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -43,6 +50,16 @@ def _create_sample_app(root: Path):
         "from app.domain.models import Invoice\n\n"
         "def charge(inv: Invoice) -> bool:\n"
         "    return inv.amount > 0\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_billing.py").write_text(
+        "import unittest\n"
+        "from app.domain.models import Invoice\n"
+        "from app.services.billing import charge\n\n"
+        "class TestBilling(unittest.TestCase):\n"
+        "    def test_charge(self):\n"
+        "        self.assertTrue(charge(Invoice(amount=10.0)))\n"
+        "        self.assertFalse(charge(Invoice(amount=0.0)))\n",
         encoding="utf-8",
     )
 
@@ -67,6 +84,7 @@ class TestAiNativeEngine(unittest.TestCase):
                 "scripts/sync_context.py",
                 "scripts/verify_architecture.py",
                 ".githooks/pre-commit",
+                ".githooks/pre-push",
             ):
                 self.assertTrue((tmp_path / expected).exists(), f"Missing {expected}")
 
@@ -89,7 +107,7 @@ class TestAiNativeEngine(unittest.TestCase):
             bootstrap_repository(tmp_path)
 
             cfg = {
-                "version": "2.0",
+                "version": "3.0",
                 "context_budget": {"max_lines": 200, "max_bytes": 20000},
                 "test_command": "",
                 "layers": [
@@ -107,6 +125,8 @@ class TestAiNativeEngine(unittest.TestCase):
             bad_file.write_text(
                 "import requests\n"
                 "from app.services import billing\n\n"
+                "def stub_fn():\n"
+                "    raise NotImplementedError()\n\n"
                 "try:\n"
                 "    pass\n"
                 "except:\n"
@@ -121,8 +141,8 @@ class TestAiNativeEngine(unittest.TestCase):
             errs = verify_workspace(tmp_path, run_tests=False)
             joined = "\n".join(errs)
             self.assertIn("[LLM Smell]", joined)
+            self.assertIn("[Unimplemented Stub]", joined)
 
-            # Remove bare except: pass so boundary & budget checks run
             bad_file.write_text(
                 "import requests\n"
                 "from app.services import billing\n",
@@ -181,15 +201,19 @@ class TestAiNativeEngine(unittest.TestCase):
             )
             self.assertEqual(post_proc.stdout.strip(), "{}")
 
-            # Add a new public function without updating app/services/AGENTS.md semantic notes
             billing_path = tmp_path / "app" / "services" / "billing.py"
             billing_path.write_text(
                 billing_path.read_text(encoding="utf-8")
-                + "\ndef refund(inv_id: str) -> bool:\n    return True\n",
+                + "\ndef refund(inv_id: str) -> bool:\n    return len(inv_id) > 0\n",
+                encoding="utf-8",
+            )
+            test_path = tmp_path / "tests" / "test_billing.py"
+            test_path.write_text(
+                test_path.read_text(encoding="utf-8")
+                + "    def test_refund(self):\n        self.assertTrue(True)\n",
                 encoding="utf-8",
             )
 
-            # Antigravity Stop hook should block with decision="continue"
             agy_stop = subprocess.run(
                 [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
@@ -201,7 +225,6 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertEqual(agy_res["decision"], "continue")
             self.assertIn("app/services/AGENTS.md", agy_res["reason"])
 
-            # Claude Code Stop hook should block with decision="block"
             cc_stop = subprocess.run(
                 [sys.executable, str(SCRIPTS_DIR / "stop_gate_hook.py")],
                 input=json.dumps({"cwd": str(tmp_path), "stop_hook_active": False}),
@@ -213,7 +236,6 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertEqual(cc_res["decision"], "block")
             self.assertIn("app/services/AGENTS.md", cc_res["reason"])
 
-            # Update semantic notes in app/services/AGENTS.md
             svc_agents = tmp_path / "app" / "services" / "AGENTS.md"
             svc_text = svc_agents.read_text(encoding="utf-8").replace(
                 "## Purpose & Invariants\n",
@@ -238,6 +260,144 @@ class TestAiNativeEngine(unittest.TestCase):
                 check=True,
             )
             self.assertEqual(json.loads(cc_allow.stdout), {})
+
+    def test_pre_tool_hook_blocks_bypass_and_unverified_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            # Antigravity & Claude Code --no-verify denial
+            agy_deny = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                input=json.dumps({
+                    "cwd": str(tmp_path),
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit --no-verify -m x"}},
+                }),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(agy_deny.stdout)["decision"], "deny")
+
+            cc_deny = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                input=json.dumps({
+                    "cwd": str(tmp_path),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git commit -n -m x"},
+                }),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(cc_deny.stdout)["decision"], "block")
+
+            # Introduce failing syntax error and attempt git push -> blocked
+            (tmp_path / "app" / "services" / "billing.py").write_text("def broken(:\n", encoding="utf-8")
+            push_deny = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "pre_tool_hook.py")],
+                input=json.dumps({
+                    "cwd": str(tmp_path),
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+                }),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            push_res = json.loads(push_deny.stdout)
+            self.assertEqual(push_res["decision"], "deny")
+            self.assertIn("git push", push_res["reason"])
+
+    def test_symbol_and_dataclass_hallucination_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _create_sample_app(tmp_path)
+
+            (tmp_path / "app" / "services" / "billing.py").write_text(
+                "from app.domain.models import Invoice, NonExistentHelper\n\n"
+                "def bad_call():\n"
+                "    return Invoice(amount=10.0, wrong_field=1)\n",
+                encoding="utf-8",
+            )
+            errs = check_symbol_and_dataclass_resolution(tmp_path)
+            joined = "\n".join(errs)
+            self.assertIn("[Hallucinated Import]", joined)
+            self.assertIn("NonExistentHelper", joined)
+            self.assertIn("[Hallucinated Dataclass Field]", joined)
+            self.assertIn("wrong_field", joined)
+
+    def test_anti_test_tampering_and_contract_regression_guards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            # Remove a field from Invoice dataclass and delete/weaken test_charge
+            (tmp_path / "app" / "domain" / "models.py").write_text(
+                "from dataclasses import dataclass\n\n@dataclass\nclass Invoice:\n    currency: str\n",
+                encoding="utf-8",
+            )
+            (tmp_path / "tests" / "test_billing.py").write_text(
+                "import unittest\n\n"
+                "class TestBilling(unittest.TestCase):\n"
+                "    @unittest.skip('later')\n"
+                "    def test_other(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            cfg = {"enforce_contract_compatibility": True, "max_layers_touched": 1, "layers": [
+                {"path": "app/domain"}, {"path": "app/services"}
+            ]}
+            (tmp_path / "app" / "services" / "billing.py").write_text("x = 1\n", encoding="utf-8")
+
+            errs = check_git_head_regressions(tmp_path, cfg)
+            joined = "\n".join(errs)
+            self.assertIn("[Collateral Contract Regression]", joined)
+            self.assertIn("amount", joined)
+            self.assertIn("[Test Tampering Blocked]", joined)
+            self.assertIn("test_charge", joined)
+            self.assertIn("[Blast Radius Exceeded]", joined)
+
+    def test_diff_scoped_ast_micro_mutation_testing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            # Add new function with a comparison that existing tests do NOT assert on
+            billing_path = tmp_path / "app" / "services" / "billing.py"
+            billing_path.write_text(
+                "from app.domain.models import Invoice\n\n"
+                "def charge(inv: Invoice) -> bool:\n"
+                "    return inv.amount > 0\n\n"
+                "def is_vip(code: str) -> bool:\n"
+                "    return code == 'VIP'\n",
+                encoding="utf-8",
+            )
+            test_cmd = "python3 -m unittest discover -s tests -p 'test_*.py'"
+            mut_errs = run_diff_mutation_check(tmp_path, test_cmd)
+            self.assertTrue(mut_errs)
+            self.assertIn("[Weak Test / Surviving Mutant]", mut_errs[0])
+
+            # Now add real assertions killing the mutant
+            test_path = tmp_path / "tests" / "test_billing.py"
+            test_path.write_text(
+                test_path.read_text(encoding="utf-8")
+                + "    def test_is_vip(self):\n"
+                + "        from app.services.billing import is_vip\n"
+                + "        self.assertTrue(is_vip('VIP'))\n"
+                + "        self.assertFalse(is_vip('REG'))\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(run_diff_mutation_check(tmp_path, test_cmd), [])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,20 @@
 {
   "ai-native-auto-sync": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/pre_tool_hook.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
-        "matcher": "write_file|edit_file|run_command",
+        "matcher": "write_file|edit_file|run_command|Write|Edit|MultiEdit|Bash",
         "hooks": [
           {
             "type": "command",
@@ -16,7 +28,7 @@
       {
         "type": "command",
         "command": "python3 ./scripts/stop_gate_hook.py",
-        "timeout": 10
+        "timeout": 15
       }
     ]
   }
