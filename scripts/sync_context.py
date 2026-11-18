@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Polyglot AST & Repository Introspector (v2.0)
+Polyglot Context & ADR Introspector (v3.1 — Pure Python 3 Stdlib)
 Updates <!-- AUTO-GENERATED:START --> ... <!-- AUTO-GENERATED:END --> blocks
 across all AGENTS.md files with:
-- Python (.py) classes, dataclasses, functions, constants, and internal imports
-- TypeScript/JS (.ts, .tsx) exported types, interfaces, functions, and routes
-- Machine-readable ADR index (from docs/adr/*.md YAML frontmatter)
+- Tier 1 Python (.py): Full AST classes, dataclasses, async/sync functions, constants, relative/absolute imports
+- Tier 2 Polyglot (.ts, .tsx, .js, .jsx, .mjs, .go, .rs, .java): Comment/string-stripped lexical exports
+- Machine-readable ADR index (from docs/adr/*.md YAML frontmatter, CRLF & list safe)
 - Context budget telemetry (line count)
 """
+from __future__ import annotations
+
 import argparse
 import ast
 import fnmatch
 import re
 from pathlib import Path
+from typing import Optional
 
 START_MARKER = "<!-- AUTO-GENERATED:START -->"
 END_MARKER = "<!-- AUTO-GENERATED:END -->"
 IGNORE_DIRS = {
     ".git", "__pycache__", "node_modules", ".next", ".venv", "venv",
-    ".idea", ".vscode", ".agents", ".githooks", "dist", "build"
+    ".idea", ".vscode", ".agents", ".githooks", "dist", "build",
 }
+POLYGLOT_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".go", ".rs", ".java"}
 
 
 def format_annotation(node) -> str:
@@ -31,40 +35,132 @@ def format_annotation(node) -> str:
         return "..."
 
 
+def _strip_matching_quotes(val: str) -> str:
+    v = val.strip()
+    if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+        return v[1:-1]
+    return v
+
+
+def resolve_relative_import(rel_path: str, module: Optional[str], level: int) -> str:
+    """Resolve Python relative imports (level > 0) against a file's repo-relative path."""
+    if level <= 0:
+        return module or ""
+    pkg_parts = list(Path(rel_path).parent.parts)
+    up = level - 1
+    if up > len(pkg_parts):
+        return ""
+    base = pkg_parts[: len(pkg_parts) - up] if up > 0 else pkg_parts
+    if module:
+        return ".".join(base + [p for p in module.split(".") if p])
+    return ".".join(base)
+
+
 def is_internal_module(mod_name: str, repo_root: Path) -> bool:
+    if not mod_name:
+        return False
     top = mod_name.split(".")[0]
     if not top or top in {"tests", "scripts", "docs"}:
         return False
     return (repo_root / top).is_dir() or (repo_root / f"{top}.py").is_file()
 
 
+def _parse_applies_to_value(raw_val: str) -> list[str]:
+    v = raw_val.strip()
+    if not v:
+        return []
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1]
+        items = [_strip_matching_quotes(part.strip()) for part in inner.split(",")]
+        return [i for i in items if i]
+    if "," in v and not (v.startswith('"') or v.startswith("'")):
+        items = [_strip_matching_quotes(part.strip()) for part in v.split(",")]
+        return [i for i in items if i]
+    single = _strip_matching_quotes(v)
+    return [single] if single else []
+
+
 def parse_adr_frontmatter(adr_path: Path, repo_root: Path) -> dict:
+    """Parse ADR YAML frontmatter safely across CRLF endings, body `---` rules, quoted colons, and lists."""
     rel_path = adr_path.relative_to(repo_root).as_posix()
-    meta = {
+    meta: dict = {
         "rel_path": rel_path,
         "id": adr_path.stem.split("-")[0].upper(),
         "title": adr_path.stem,
         "status": "accepted",
         "applies_to": "*",
+        "applies_to_list": ["*"],
         "summary": "",
     }
     try:
-        text = adr_path.read_text(encoding="utf-8")
+        raw = adr_path.read_text(encoding="utf-8")
     except Exception:
         return meta
 
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            fm = parts[1]
-            for line in fm.splitlines():
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    k = k.strip().lower()
-                    v = v.strip().strip('"').strip("'")
-                    if k in meta:
-                        meta[k] = v
+    text = raw.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    open_m = re.match(r"^---[ \t]*\n", text)
+    if not open_m:
+        return meta
+
+    rest = text[open_m.end():]
+    close_m = re.search(r"(?:^|\n)---[ \t]*(?:\n|$)", rest)
+    if not close_m:
+        return meta
+
+    fm = rest[:close_m.start()]
+    current_list_key: Optional[str] = None
+    parsed_lists: dict[str, list[str]] = {}
+
+    for line in fm.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        list_item_m = re.match(r"^[ \t]+-[ \t]+(.+)$", line)
+        if list_item_m and current_list_key:
+            item_val = _strip_matching_quotes(list_item_m.group(1).strip())
+            if item_val:
+                parsed_lists.setdefault(current_list_key, []).append(item_val)
+            continue
+
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().lower()
+            v_str = v.strip()
+            current_list_key = None
+            if k == "applies_to":
+                if not v_str:
+                    current_list_key = "applies_to"
+                    parsed_lists["applies_to"] = []
+                else:
+                    vals = _parse_applies_to_value(v_str)
+                    if vals:
+                        meta["applies_to_list"] = vals
+                        meta["applies_to"] = ", ".join(vals)
+            elif k in meta:
+                meta[k] = _strip_matching_quotes(v_str)
+
+    if "applies_to" in parsed_lists and parsed_lists["applies_to"]:
+        meta["applies_to_list"] = parsed_lists["applies_to"]
+        meta["applies_to"] = ", ".join(parsed_lists["applies_to"])
+
     return meta
+
+
+def adr_matches_directory(adr: dict, rel_dir: str) -> bool:
+    patterns = adr.get("applies_to_list") or _parse_applies_to_value(str(adr.get("applies_to", "*"))) or ["*"]
+    for pat in patterns:
+        pat_clean = pat.strip()
+        if not pat_clean:
+            continue
+        if pat_clean == "*":
+            return True
+        if fnmatch.fnmatch(rel_dir, pat_clean.rstrip("/*")):
+            return True
+        if fnmatch.fnmatch(f"{rel_dir}/", pat_clean):
+            return True
+        if pat_clean == rel_dir or pat_clean.startswith(rel_dir + "/"):
+            return True
+    return False
 
 
 def load_all_adrs(repo_root: Path) -> list[dict]:
@@ -78,9 +174,21 @@ def load_all_adrs(repo_root: Path) -> list[dict]:
     ]
 
 
+def _format_fn_sig(node: ast.AST, skip_self: bool = False) -> str:
+    params = []
+    for a in node.args.args:  # type: ignore[attr-defined]
+        if skip_self and a.arg == "self":
+            continue
+        ann = format_annotation(a.annotation)
+        params.append(f"{a.arg}: {ann}" if ann else a.arg)
+    ret = format_annotation(node.returns)  # type: ignore[attr-defined]
+    prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+    return f"{prefix}{node.name}({', '.join(params)})" + (f" -> {ret}" if ret else "")  # type: ignore[attr-defined]
+
+
 def inspect_python_file(py_path: Path, rel_to: Path) -> dict:
     rel_path = py_path.relative_to(rel_to).as_posix()
-    info = {
+    info: dict = {
         "rel_path": rel_path,
         "constants": [],
         "classes": [],
@@ -94,17 +202,22 @@ def inspect_python_file(py_path: Path, rel_to: Path) -> dict:
         info["error"] = str(exc)
         return info
 
-    seen_imports = set()
+    seen_imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if is_internal_module(alias.name, rel_to) and alias.name not in seen_imports:
                     seen_imports.add(alias.name)
                     info["internal_imports"].append(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            if is_internal_module(node.module, rel_to) and node.module not in seen_imports:
-                seen_imports.add(node.module)
-                info["internal_imports"].append(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            resolved = (
+                resolve_relative_import(rel_path, node.module, node.level)
+                if node.level > 0
+                else (node.module or "")
+            )
+            if resolved and is_internal_module(resolved, rel_to) and resolved not in seen_imports:
+                seen_imports.add(resolved)
+                info["internal_imports"].append(resolved)
 
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -128,15 +241,8 @@ def inspect_python_file(py_path: Path, rel_to: Path) -> dict:
                 if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                     f_ann = format_annotation(item.annotation)
                     fields.append(f"{item.target.id}: {f_ann}" if f_ann else item.target.id)
-                elif isinstance(item, ast.FunctionDef) and not item.name.startswith("_"):
-                    args = [
-                        f"{a.arg}: {format_annotation(a.annotation)}" if a.annotation else a.arg
-                        for a in item.args.args
-                        if a.arg != "self"
-                    ]
-                    ret = format_annotation(item.returns)
-                    sig = f"{item.name}({', '.join(args)})" + (f" -> {ret}" if ret else "")
-                    methods.append(sig)
+                elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and not item.name.startswith("_"):
+                    methods.append(_format_fn_sig(item, skip_self=True))
             info["classes"].append({
                 "name": node.name,
                 "bases": bases,
@@ -144,28 +250,144 @@ def inspect_python_file(py_path: Path, rel_to: Path) -> dict:
                 "fields": fields,
                 "methods": methods,
             })
-        elif isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
-            args = [
-                f"{a.arg}: {format_annotation(a.annotation)}" if a.annotation else a.arg
-                for a in node.args.args
-            ]
-            ret = format_annotation(node.returns)
-            sig = f"{node.name}({', '.join(args)})" + (f" -> {ret}" if ret else "")
-            info["functions"].append(sig)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            info["functions"].append(_format_fn_sig(node, skip_self=False))
 
     return info
 
 
-def inspect_ts_file(ts_path: Path, rel_to: Path) -> dict:
-    rel_path = ts_path.relative_to(rel_to).as_posix()
-    exports = []
+def strip_comments_and_strings(text: str, hash_comments: bool = False) -> str:
+    """
+    Strip /* ... */ block comments, // (and optional #) line comments, and replace
+    string/template literal contents with "" while preserving newlines.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        # Block comment /* ... */
+        if ch == "/" and nxt == "*":
+            out.append(" ")
+            i += 2
+            while i < n and not (text[i] == "*" and (i + 1 < n and text[i + 1] == "/")):
+                if text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            continue
+        # Line comment //
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        # Optional hash comment
+        if hash_comments and ch == "#":
+            i += 1
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        # String or template literal: "...", '...', `...`
+        if ch in ('"', "'", "`"):
+            quote = ch
+            out.append(quote)
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                if c == "\n":
+                    out.append("\n")
+                i += 1
+            out.append(quote)
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def inspect_polyglot_file(file_path: Path, rel_to: Path) -> dict:
+    """Extract lexical exports from TS/JS/Go/Rust/Java after stripping comments and strings."""
+    rel_path = file_path.relative_to(rel_to).as_posix()
+    suffix = file_path.suffix.lower()
+    exports: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str):
+        if name and name not in seen:
+            seen.add(name)
+            exports.append(name)
+
     try:
-        text = ts_path.read_text(encoding="utf-8")
-        for m in re.finditer(r"export\s+(?:async\s+)?(?:function|const|class|interface|type)\s+([A-Za-z0-9_]+)", text):
-            exports.append(m.group(1))
+        raw = file_path.read_text(encoding="utf-8")
     except Exception:
-        pass
+        return {"rel_path": rel_path, "exports": []}
+
+    cleaned = strip_comments_and_strings(raw)
+
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs"}:
+        decl_pat = re.compile(
+            r"(?:^|[;\s}])export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?"
+            r"(?:function\s*\*?|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+            re.M,
+        )
+        for m in decl_pat.finditer(cleaned):
+            _add(m.group(1))
+        brace_pat = re.compile(r"(?:^|[;\s}])export\s+(?:type\s+)?\{([^}]+)\}", re.M)
+        for m in brace_pat.finditer(cleaned):
+            for item in m.group(1).split(","):
+                part = item.strip()
+                if not part:
+                    continue
+                if " as " in part:
+                    _add(part.split(" as ", 1)[1].strip())
+                else:
+                    _add(part.split()[-1])
+    elif suffix == ".go":
+        go_fn = re.compile(r"^func\s+(?:\([^)]+\)\s*)?([A-Z][A-Za-z0-9_]*)\s*(?:\[|\()", re.M)
+        go_type = re.compile(r"^type\s+([A-Z][A-Za-z0-9_]*)\b", re.M)
+        for m in go_fn.finditer(cleaned):
+            _add(m.group(1))
+        for m in go_type.finditer(cleaned):
+            _add(m.group(1))
+    elif suffix == ".rs":
+        rs_pat = re.compile(
+            r"(?:^|\n)\s*pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?"
+            r"(?:fn|struct|enum|trait|type|const|static|mod)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            re.M,
+        )
+        for m in rs_pat.finditer(cleaned):
+            _add(m.group(1))
+    elif suffix == ".java":
+        java_pat = re.compile(
+            r"\bpublic\s+(?:abstract\s+|final\s+|static\s+|sealed\s+)*"
+            r"(?:class|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            re.M,
+        )
+        for m in java_pat.finditer(cleaned):
+            _add(m.group(1))
+
     return {"rel_path": rel_path, "exports": exports}
+
+
+def inspect_ts_file(ts_path: Path, rel_to: Path) -> dict:
+    """Backward-compatible wrapper around inspect_polyglot_file for TS/JS modules."""
+    return inspect_polyglot_file(ts_path, rel_to)
+
+
+def _iter_polyglot_files(dir_path: Path) -> list[Path]:
+    return sorted(
+        p for p in dir_path.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in POLYGLOT_EXTENSIONS
+        and not any(part in IGNORE_DIRS for part in p.relative_to(dir_path).parts)
+    )
 
 
 def build_root_block(repo_root: Path) -> str:
@@ -218,13 +440,8 @@ def build_root_block(repo_root: Path) -> str:
         desc = " | ".join(summary_parts) if summary_parts else "Module"
         lines.append(f"- `{rel}` — {desc}")
 
-    ts_files = sorted(
-        p for p in repo_root.rglob("*.ts*")
-        if not any(part in IGNORE_DIRS for part in p.relative_to(repo_root).parts)
-        and p.suffix in {".ts", ".tsx"}
-    )
-    for tf in ts_files:
-        t_info = inspect_ts_file(tf, repo_root)
+    for tf in _iter_polyglot_files(repo_root):
+        t_info = inspect_polyglot_file(tf, repo_root)
         exp = ", ".join(f"`{e}`" for e in t_info["exports"]) if t_info["exports"] else "Module"
         lines.append(f"- `{t_info['rel_path']}` — Exports: {exp}")
 
@@ -242,13 +459,7 @@ def build_directory_block(dir_path: Path, repo_root: Path) -> str:
     ]
 
     adrs = load_all_adrs(repo_root)
-    matching_adrs = [
-        a for a in adrs
-        if fnmatch.fnmatch(rel_dir, a["applies_to"].rstrip("/*"))
-        or fnmatch.fnmatch(f"{rel_dir}/", a["applies_to"])
-        or a["applies_to"].startswith(rel_dir)
-        or a["applies_to"] == "*"
-    ]
+    matching_adrs = [a for a in adrs if adr_matches_directory(a, rel_dir)]
     if matching_adrs:
         lines.append("#### Governing ADRs for This Layer")
         for adr in matching_adrs:
@@ -260,13 +471,9 @@ def build_directory_block(dir_path: Path, repo_root: Path) -> str:
         if not any(part in IGNORE_DIRS for part in p.relative_to(dir_path).parts)
         and p.name != "__init__.py"
     )
-    ts_files = sorted(
-        p for p in dir_path.rglob("*.ts*")
-        if not any(part in IGNORE_DIRS for part in p.relative_to(dir_path).parts)
-        and p.suffix in {".ts", ".tsx"}
-    )
+    poly_files = _iter_polyglot_files(dir_path)
 
-    if not py_files and not ts_files:
+    if not py_files and not poly_files:
         lines.append("_No source modules found in this directory._")
         lines.append(END_MARKER)
         return "\n".join(lines)
@@ -295,8 +502,8 @@ def build_directory_block(dir_path: Path, repo_root: Path) -> str:
             lines.append(f"- **Function:** `{fn}`")
         lines.append("")
 
-    for tf in ts_files:
-        t_info = inspect_ts_file(tf, repo_root)
+    for tf in poly_files:
+        t_info = inspect_polyglot_file(tf, repo_root)
         lines.append(f"#### `{t_info['rel_path']}`")
         if t_info["exports"]:
             lines.append("- **Exports:** " + ", ".join(f"`{e}`" for e in t_info["exports"]))

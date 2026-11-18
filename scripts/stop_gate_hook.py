@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
+"""
+Stop Gate Verification & Semantic Drift Guard (v3.1)
+Supports Antigravity, Claude Code, Cursor, Codex, and Gemini CLI Stop payloads.
+Enforces:
+1. Safe re-entry escape hatch (`stop_hook_active` / `continuationActive`) to prevent infinite refusal loops.
+2. Full verification via verify_architecture.verify_workspace().
+3. Public-contract-only Semantic Drift Gate with whitespace normalization (blocks space/blank-line bypasses
+   and avoids false positives when only private helper bodies change), naming the exact file & symbols.
+"""
+from __future__ import annotations
+
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from sync_context import END_MARKER, START_MARKER, sync_workspace
-from verify_architecture import verify_workspace
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from sync_context import END_MARKER, START_MARKER, sync_workspace  # noqa: E402
+from verify_architecture import verify_workspace  # noqa: E402
 
 
 def split_semantic_and_auto(text: str) -> tuple[str, str]:
@@ -19,13 +35,37 @@ def split_semantic_and_auto(text: str) -> tuple[str, str]:
     return (before + "\n" + after).strip(), auto_body.strip()
 
 
+def normalize_semantic_prose(text: str) -> str:
+    """Collapse all whitespace sequences so cosmetic spacing/blank-line edits cannot bypass semantic drift."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_public_contract_lines(auto_body: str) -> set[str]:
+    """Extract only public symbol/import/export contract entries, ignoring formatting/module boilerplate."""
+    contracts: set[str] = set()
+    for line in auto_body.splitlines():
+        s = line.strip()
+        if (
+            s.startswith("- **Dataclass ")
+            or s.startswith("- **Class ")
+            or s.startswith("- **Function:**")
+            or s.startswith("- **Constants:**")
+            or s.startswith("- **Exports:**")
+            or s.startswith("- **Internal Imports:**")
+            or s.startswith("- Fields:")
+            or s.startswith("- Method:")
+        ):
+            contracts.add(s)
+    return contracts
+
+
 def check_semantic_drift(ws_path: Path) -> list[str]:
     """
-    If a tracked AGENTS.md file has changes inside its AUTO-GENERATED contract block
-    compared to git HEAD (meaning classes, functions, or fields were added/removed/changed),
-    verify whether the semantic section of that AGENTS.md was also updated.
+    Compare public code contracts in each tracked layer AGENTS.md vs git HEAD.
+    Requires non-whitespace semantic prose updates only when public contracts actually changed.
+    Returns descriptive entries naming exact AGENTS.md paths and changed contract symbols.
     """
-    drifted = []
+    drifted: list[str] = []
     try:
         proc = subprocess.run(
             ["git", "diff", "--name-only", "HEAD", "--", "*AGENTS.md", "AGENTS.md"],
@@ -57,8 +97,13 @@ def check_semantic_drift(ws_path: Path) -> list[str]:
                 continue
             old_sem, old_auto = split_semantic_and_auto(head_proc.stdout)
             new_sem, new_auto = split_semantic_and_auto(full_path.read_text(encoding="utf-8"))
-            if old_auto != new_auto and old_sem == new_sem:
-                drifted.append(rel_path)
+            old_contracts = extract_public_contract_lines(old_auto)
+            new_contracts = extract_public_contract_lines(new_auto)
+            if old_contracts != new_contracts:
+                if normalize_semantic_prose(old_sem) == normalize_semantic_prose(new_sem):
+                    changed_syms = sorted(old_contracts ^ new_contracts)
+                    preview = "; ".join(changed_syms[:3])
+                    drifted.append(f"{rel_path} (changed contract: {preview})" if preview else rel_path)
         except Exception:
             continue
     return drifted
@@ -74,27 +119,42 @@ def format_response(is_claude_code: bool, allow: bool, reason: str = "") -> str:
     return json.dumps({"decision": "continue", "reason": reason})
 
 
+def extract_workspaces(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    workspaces: list[str] = []
+    for key in ("workspacePaths", "workspace_roots", "workspaces"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, str) and item and item not in workspaces:
+                    workspaces.append(item)
+    for key in ("cwd", "workspace", "workspaceRoot"):
+        val = payload.get(key)
+        if isinstance(val, str) and val and val not in workspaces:
+            workspaces.append(val)
+    return workspaces
+
+
 def main():
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
 
-    is_claude_code = "stop_hook_active" in payload
-    if is_claude_code:
-        if payload.get("stop_hook_active"):
-            print(format_response(True, True))
-            return
-    elif payload.get("continuationActive") or payload.get("terminationReason") != "NO_TOOL_CALL":
+    has_termination_reason = "terminationReason" in payload
+    is_claude_code = not has_termination_reason
+
+    if payload.get("stop_hook_active") or payload.get("continuationActive"):
+        print(format_response(is_claude_code, True))
+        return
+    if has_termination_reason and payload.get("terminationReason") != "NO_TOOL_CALL":
         print(format_response(False, True))
         return
 
-    workspaces = payload.get("workspacePaths") or []
-    cwd = payload.get("cwd")
-    if cwd and cwd not in workspaces:
-        workspaces.append(cwd)
-
-    for ws in workspaces:
+    for ws in extract_workspaces(payload):
         ws_path = Path(ws)
         if not (ws_path / "AGENTS.md").exists():
             continue
@@ -105,7 +165,7 @@ def main():
         except Exception:
             pass
 
-        # 2. Verify syntax, layer import boundaries, context budgets, and unit tests
+        # 2. Verify syntax, hallucinations, layer boundaries, tampering, budgets, tests & mutations
         errs = verify_workspace(ws_path, run_tests=True)
         if errs:
             print(format_response(
@@ -123,8 +183,8 @@ def main():
                 False,
                 (
                     f"[ai-native-repo Stop Gate] Public code contracts changed in {', '.join(drifted)}, "
-                    "but the semantic notes outside the <!-- AUTO-GENERATED --> block were not updated. "
-                    "Please review and update the semantic section of those AGENTS.md file(s) before finishing."
+                    "but the semantic prose outside the <!-- AUTO-GENERATED --> block was not meaningfully updated. "
+                    "Please document the contract change in those AGENTS.md file(s) before finishing."
                 ),
             ))
             return
