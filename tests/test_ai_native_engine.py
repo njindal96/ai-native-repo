@@ -952,6 +952,106 @@ class TestAiNativeEngine(unittest.TestCase):
             )
             self.assertEqual(check_adr_completeness(tmp_path), [])
 
+    def test_friction_and_opportunity_detector_all_four_rules(self):
+        # 0 & Rule 1: Normal single edit stays silent; rework across cycles without ADR edit nudges once
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+            cfg_p = tmp_path / ".ai-native.json"
+            cfg_obj = json.loads(cfg_p.read_text(encoding="utf-8"))
+            cfg_obj["mutation_testing"] = False
+            cfg_p.write_text(json.dumps(cfg_obj), encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            # Single normal edit -> Stop must remain completely silent
+            _run_hook_inproc(post_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "edit_file", "args": {"Path": str(tmp_path / "app" / "services" / "billing.py")}},
+            })
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
+            )
+
+            # Rework after Stop/test cycle without updating docs/adr/ -> fires Rule 1 once
+            _run_hook_inproc(post_tool_hook, {
+                "cwd": str(tmp_path),
+                "toolCall": {"name": "edit_file", "args": {"Path": str(tmp_path / "app" / "services" / "billing.py")}},
+            })
+            nudge = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
+            self.assertEqual(nudge["decision"], "continue")
+            self.assertIn("[ai-native-repo Friction Detector — Uncaptured Course-Correction]", nudge["reason"])
+            self.assertIn("app/services/billing.py", nudge["reason"])
+
+            # Immediate retry allows due to cooldown
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
+            )
+
+        # Rule 2: Context Thrashing (>=8 exploratory reads before edit in un-onboarded Git repo)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            for i in range(7):
+                _run_hook_inproc(post_tool_hook, {
+                    "cwd": str(tmp_path),
+                    "toolCall": {"name": "read_file", "args": {"Path": str(tmp_path / f"f{i}.py")}},
+                })
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
+            )
+            _run_hook_inproc(post_tool_hook, {
+                "cwd": str(tmp_path),
+                "tool_name": "Grep",
+                "tool_input": {"path": str(tmp_path)},
+            })
+            thrash = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
+            self.assertEqual(thrash["decision"], "continue")
+            self.assertIn("[ai-native-repo Opportunity Detector — Context Thrashing]", thrash["reason"])
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
+            )
+
+        # Rule 3: Repeated 3-step command sequence
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for _ in range(3):
+                for step in ("python3 fetch.py", "python3 validate.py", "python3 export.py"):
+                    _run_hook_inproc(post_tool_hook, {
+                        "cwd": str(tmp_path),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": step}},
+                    })
+            wf_nudge = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
+            self.assertEqual(wf_nudge["decision"], "continue")
+            self.assertIn("[ai-native-repo Opportunity Detector — Repeated Workflow]", wf_nudge["reason"])
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"}),
+                {"decision": "allow"},
+            )
+
+        # Rule 4: Recurring polling / status command
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for _ in range(3):
+                _run_hook_inproc(post_tool_hook, {
+                    "cwd": str(tmp_path),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "gh run list --limit 5"},
+                })
+            poll_nudge = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": False})
+            self.assertEqual(poll_nudge["decision"], "block")
+            self.assertIn("[ai-native-repo Opportunity Detector — Automation Candidate]", poll_nudge["reason"])
+            self.assertEqual(
+                _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "stop_hook_active": False}),
+                {},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

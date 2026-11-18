@@ -20,6 +20,7 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+from post_tool_hook import evaluate_friction_opportunities  # noqa: E402
 from sync_context import END_MARKER, START_MARKER, sync_workspace  # noqa: E402
 from verify_architecture import verify_workspace  # noqa: E402
 
@@ -156,37 +157,47 @@ def main():
 
     for ws in extract_workspaces(payload):
         ws_path = Path(ws)
-        if not (ws_path / "AGENTS.md").exists():
+        if not ws_path.is_dir():
             continue
 
-        # 1. Sync all AGENTS.md auto-generated blocks
+        if (ws_path / "AGENTS.md").exists():
+            # 1. Sync all AGENTS.md auto-generated blocks
+            try:
+                sync_workspace(ws_path)
+            except Exception:
+                pass
+
+            # 2. Verify syntax, hallucinations, layer boundaries, tampering, budgets, tests & mutations
+            errs = verify_workspace(ws_path, run_tests=True)
+            if errs:
+                print(format_response(
+                    is_claude_code,
+                    False,
+                    "[ai-native-repo Stop Gate] Verification failed:\n" + "\n".join(errs[:5]),
+                ))
+                return
+
+            # 3. Check for semantic drift on scoped AGENTS.md files
+            drifted = check_semantic_drift(ws_path)
+            if drifted:
+                print(format_response(
+                    is_claude_code,
+                    False,
+                    (
+                        f"[ai-native-repo Stop Gate] Public code contracts changed in {', '.join(drifted)}, "
+                        "but the semantic prose outside the <!-- AUTO-GENERATED --> block was not meaningfully updated. "
+                        "Please document the contract change in those AGENTS.md file(s) before finishing."
+                    ),
+                ))
+                return
+
+        # 4. Threshold-gated Silent Friction & Opportunity Detector (any repository)
         try:
-            sync_workspace(ws_path)
+            opportunity = evaluate_friction_opportunities(ws_path)
         except Exception:
-            pass
-
-        # 2. Verify syntax, hallucinations, layer boundaries, tampering, budgets, tests & mutations
-        errs = verify_workspace(ws_path, run_tests=True)
-        if errs:
-            print(format_response(
-                is_claude_code,
-                False,
-                "[ai-native-repo Stop Gate] Verification failed:\n" + "\n".join(errs[:5]),
-            ))
-            return
-
-        # 3. Check for semantic drift on scoped AGENTS.md files
-        drifted = check_semantic_drift(ws_path)
-        if drifted:
-            print(format_response(
-                is_claude_code,
-                False,
-                (
-                    f"[ai-native-repo Stop Gate] Public code contracts changed in {', '.join(drifted)}, "
-                    "but the semantic prose outside the <!-- AUTO-GENERATED --> block was not meaningfully updated. "
-                    "Please document the contract change in those AGENTS.md file(s) before finishing."
-                ),
-            ))
+            opportunity = None
+        if opportunity:
+            print(format_response(is_claude_code, False, opportunity))
             return
 
     print(format_response(is_claude_code, True))

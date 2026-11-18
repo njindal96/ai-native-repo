@@ -1,20 +1,56 @@
 #!/usr/bin/env python3
 """
-PostToolUse Contract Sync Hook (v3.1)
-Defensively extracts workspace paths across Antigravity, Claude Code, Cursor, Codex, and Gemini CLI,
-then re-syncs AGENTS.md auto-generated contract blocks with zero crashes on arbitrary/malformed payloads.
+PostToolUse Contract Sync Hook & Silent Friction Telemetry Collector (v3.3)
+1. Defensively extracts workspace paths and tool telemetry across Antigravity, Claude Code,
+   Cursor, Codex, and Gemini CLI with zero crashes on arbitrary/malformed payloads.
+2. Collects zero-token friction/pattern telemetry in a temporary per-workspace ledger.
+3. Re-syncs AGENTS.md auto-generated contract blocks whenever AGENTS.md exists.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
+from typing import Optional
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from sync_context import sync_workspace  # noqa: E402
+from sync_context import adr_matches_path, load_all_adrs, sync_workspace  # noqa: E402
+
+READ_SEARCH_TOOLS = {
+    "read_file",
+    "view_file",
+    "Read",
+    "grep_search",
+    "find_by_name",
+    "Grep",
+    "Glob",
+}
+EDIT_TOOLS = {"edit_file", "write_file", "Edit", "Write", "MultiEdit"}
+SHELL_TOOLS = {
+    "run_command",
+    "Bash",
+    "bash",
+    "shell",
+    "run_shell_command",
+    "execute_command",
+    "terminal",
+}
+TRIVIAL_SHELL_PREFIXES = ("git status", "git diff", "git log", "pwd", "ls", "echo ", "true")
+POLL_SHELL_PREFIXES = (
+    "gh run",
+    "curl ",
+    "kubectl get",
+    "docker ps",
+    "python -m pipeline",
+    "python3 -m pipeline",
+)
 
 
 def extract_workspaces(payload: object) -> list[str]:
@@ -34,6 +70,298 @@ def extract_workspaces(payload: object) -> list[str]:
     return workspaces
 
 
+def get_telemetry_path(ws_path: Path) -> Path:
+    digest = hashlib.sha256(str(ws_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"ai_native_telemetry_{digest}.json"
+
+
+def _default_telemetry(now: float) -> dict:
+    return {
+        "updated_at": now,
+        "last_tool_category": "",
+        "last_edited_file": "",
+        "exploratory_reads_before_edit": 0,
+        "first_edit_done": False,
+        "adr_or_agents_edited": False,
+        "layer_file_edits": {},
+        "shell_history": [],
+        "command_ngrams": {},
+        "poll_commands": {},
+        "cooldowns_fired": {},
+    }
+
+
+def load_telemetry(ws_path: Path, ttl_seconds: int = 14400) -> dict:
+    now = time.time()
+    path = get_telemetry_path(ws_path)
+    base = _default_telemetry(now)
+    if not path.is_file():
+        return base
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return base
+        if (now - float(data.get("updated_at", 0.0))) > ttl_seconds:
+            return base
+        for k, default_v in base.items():
+            val = data.get(k)
+            if type(val) is type(default_v):
+                base[k] = val
+        return base
+    except Exception:
+        return base
+
+
+def save_telemetry(ws_path: Path, state: dict) -> None:
+    state["updated_at"] = time.time()
+    path = get_telemetry_path(ws_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def extract_tool_event(payload: object) -> tuple[str, str, str]:
+    """Defensively extract (tool_name, file_target, command) across 5 agent payload formats."""
+    if not isinstance(payload, dict):
+        return "", "", ""
+
+    tool_call = payload.get("toolCall")
+    if isinstance(tool_call, dict):
+        tool_name = str(tool_call.get("name") or "")
+        args = tool_call.get("args")
+        if isinstance(args, dict):
+            file_target = str(
+                args.get("Path")
+                or args.get("TargetFile")
+                or args.get("file_path")
+                or args.get("path")
+                or args.get("SearchPath")
+                or args.get("DirectoryPath")
+                or ""
+            )
+            cmd = str(args.get("CommandLine") or args.get("command") or "")
+        else:
+            file_target, cmd = "", ""
+        return tool_name, file_target, cmd
+
+    tool_name = str(payload.get("tool_name") or payload.get("tool") or "")
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        file_target = str(
+            tool_input.get("file_path")
+            or tool_input.get("path")
+            or tool_input.get("TargetFile")
+            or tool_input.get("Path")
+            or ""
+        )
+        cmd = str(tool_input.get("command") or tool_input.get("CommandLine") or tool_input.get("cmd") or "")
+    elif isinstance(tool_input, str):
+        file_target, cmd = "", tool_input
+    else:
+        file_target = str(payload.get("file_path") or payload.get("path") or "")
+        cmd = str(payload.get("command") or "")
+    return tool_name, file_target, cmd
+
+
+def normalize_shell_command(cmd: str) -> str:
+    norm = " ".join((cmd or "").split()).strip()
+    if not norm:
+        return ""
+    lower = norm.lower()
+    if any(lower == p.strip() or lower.startswith(p) for p in TRIVIAL_SHELL_PREFIXES):
+        return ""
+    return norm[:180]
+
+
+def _to_rel_path(ws_path: Path, file_target: str) -> str:
+    if not file_target:
+        return ""
+    p = Path(file_target).expanduser()
+    ws_res = ws_path.resolve()
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(ws_res).as_posix()
+        except Exception:
+            return p.as_posix()
+    return p.as_posix().lstrip("./")
+
+
+def _is_layer_source(ws_path: Path, rel_path: str) -> bool:
+    if not rel_path:
+        return False
+    norm = Path(rel_path).as_posix().lstrip("./")
+    if Path(norm).name in {"AGENTS.md", "CLAUDE.md", ".ai-native.json"}:
+        return False
+    if any(norm.startswith(prefix) for prefix in ("docs/", "tests/", "scripts/", ".githooks/")):
+        return False
+    cfg_path = ws_path / ".ai-native.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    for layer in cfg.get("layers", []):
+        lp = str(layer.get("path") or "").strip().strip("/")
+        if lp and (norm == lp or norm.startswith(lp + "/")):
+            return True
+    return False
+
+
+def record_tool_telemetry(ws_path: Path, payload: object) -> None:
+    tool_name, file_target, cmd = extract_tool_event(payload)
+    if not tool_name:
+        return
+
+    state = load_telemetry(ws_path)
+    if tool_name in READ_SEARCH_TOOLS:
+        if not state["first_edit_done"]:
+            state["exploratory_reads_before_edit"] += 1
+        state["last_tool_category"] = "read"
+        save_telemetry(ws_path, state)
+        return
+
+    if tool_name in EDIT_TOOLS:
+        state["first_edit_done"] = True
+        rel_path = _to_rel_path(ws_path, file_target)
+        if rel_path:
+            if Path(rel_path).name in {"AGENTS.md", "CLAUDE.md"} or rel_path.startswith("docs/adr/"):
+                state["adr_or_agents_edited"] = True
+            elif _is_layer_source(ws_path, rel_path):
+                entry = state["layer_file_edits"].setdefault(
+                    rel_path,
+                    {"edit_count": 0, "rework_cycles": 0, "reverted": False},
+                )
+                entry["edit_count"] = int(entry.get("edit_count", 0)) + 1
+                if entry["edit_count"] >= 2 and (
+                    state.get("last_tool_category") != "edit"
+                    or state.get("last_edited_file") != rel_path
+                ):
+                    entry["rework_cycles"] = int(entry.get("rework_cycles", 0)) + 1
+            state["last_edited_file"] = rel_path
+        state["last_tool_category"] = "edit"
+        save_telemetry(ws_path, state)
+        return
+
+    if tool_name in SHELL_TOOLS and cmd:
+        lower_cmd = cmd.lower()
+        if "git checkout" in lower_cmd or "git restore" in lower_cmd:
+            for edited_rel, entry in state["layer_file_edits"].items():
+                if edited_rel in cmd or Path(edited_rel).name in cmd:
+                    entry["reverted"] = True
+
+        norm_cmd = normalize_shell_command(cmd)
+        if norm_cmd:
+            if norm_cmd.lower().startswith(POLL_SHELL_PREFIXES):
+                state["poll_commands"][norm_cmd] = int(state["poll_commands"].get(norm_cmd, 0)) + 1
+
+            history: list[str] = state["shell_history"]
+            if not history or history[-1] != norm_cmd:
+                history.append(norm_cmd)
+                if len(history) > 30:
+                    del history[:-30]
+                if len(history) >= 3:
+                    tri = history[-3:]
+                    if len(set(tri)) == 3:
+                        key = " -> ".join(tri)
+                        state["command_ngrams"][key] = int(state["command_ngrams"].get(key, 0)) + 1
+
+        state["last_tool_category"] = "shell"
+        save_telemetry(ws_path, state)
+
+
+def _has_adr_git_changes(ws_path: Path) -> bool:
+    if not (ws_path / ".git").exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--", "docs/adr/"],
+            cwd=str(ws_path),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return bool(proc.stdout.strip())
+    except Exception:
+        return False
+
+
+def evaluate_friction_opportunities(ws_path: Path) -> Optional[str]:
+    """
+    Evaluate 4 deterministic friction & opportunity thresholds at turn completion.
+    Fires at most 1 nudge per turn (recording its cooldown key so it never nags twice).
+    """
+    state = load_telemetry(ws_path)
+    state["last_tool_category"] = "stop"
+    cooldowns: dict = state["cooldowns_fired"]
+    now = time.time()
+
+    # Rule 1: Uncaptured Course-Correction (rework or revert in a layer file without ADR update)
+    if (ws_path / ".ai-native.json").is_file() and not state["adr_or_agents_edited"] and not _has_adr_git_changes(ws_path):
+        for rel_path, entry in sorted(state["layer_file_edits"].items()):
+            rework = int(entry.get("rework_cycles", 0))
+            edits = int(entry.get("edit_count", 0))
+            reverted = bool(entry.get("reverted", False))
+            cd_key = f"rework:{rel_path}"
+            if (rework >= 1 or reverted or edits >= 3) and cd_key not in cooldowns:
+                cooldowns[cd_key] = now
+                save_telemetry(ws_path, state)
+                matching_adrs = [a["rel_path"] for a in load_all_adrs(ws_path) if adr_matches_path(a, rel_path)]
+                adr_hint = ", ".join(matching_adrs) if matching_adrs else "docs/adr/"
+                return (
+                    f"[ai-native-repo Friction Detector — Uncaptured Course-Correction] "
+                    f"`{rel_path}` was reworked across multiple cycles (edits={edits}, rework={rework}, reverted={reverted}) "
+                    f"without any update to its governing ADR (`{adr_hint}`). Before ending or in 1 line at the end of your reply, "
+                    "record or offer to persist the `Context & Why` / `Anti-Patterns / Do Not Do` lesson so future agents do not repeat the mistake."
+                )
+
+    # Rule 2: Context Thrashing in an un-onboarded repo
+    is_unonboarded = (
+        not (ws_path / "AGENTS.md").exists()
+        and not (ws_path / ".ai-native.json").exists()
+        and (ws_path / ".git").exists()
+    )
+    if is_unonboarded and int(state.get("exploratory_reads_before_edit", 0)) >= 8 and "bootstrap_repo" not in cooldowns:
+        cooldowns["bootstrap_repo"] = now
+        save_telemetry(ws_path, state)
+        cnt = state["exploratory_reads_before_edit"]
+        return (
+            f"[ai-native-repo Opportunity Detector — Context Thrashing] "
+            f"You executed {cnt} exploratory read/search calls before editing in an un-onboarded repository. "
+            "Append a 1-line offer to run `bootstrap_repo.py` so future tasks get 1-hop Context Capsules (`--for`), "
+            "`Used By`/`Tested By` maps, and guardrail checks."
+        )
+
+    # Rule 3: Repeated 3-step command sequence
+    for ngram, count in sorted(state["command_ngrams"].items()):
+        cd_key = f"ngram:{ngram}"
+        if int(count) >= 3 and cd_key not in cooldowns:
+            cooldowns[cd_key] = now
+            save_telemetry(ws_path, state)
+            return (
+                f"[ai-native-repo Opportunity Detector — Repeated Workflow] "
+                f"The 3-step command workflow `{ngram}` ran {count} times. "
+                "Append a 1-line offer at the end of your reply to package it into a reusable script or `.agents/skills/` skill."
+            )
+
+    # Rule 4: Recurring status / polling command
+    for cmd_str, count in sorted(state["poll_commands"].items()):
+        cd_key = f"poll:{cmd_str}"
+        if int(count) >= 3 and cd_key not in cooldowns:
+            cooldowns[cd_key] = now
+            save_telemetry(ws_path, state)
+            return (
+                f"[ai-native-repo Opportunity Detector — Automation Candidate] "
+                f"The status/polling command `{cmd_str}` ran {count} times. "
+                "Append a 1-line offer at the end of your reply to turn it into a `/schedule` cron or GitHub Actions automation."
+            )
+
+    save_telemetry(ws_path, state)
+    return None
+
+
 def main():
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -42,6 +370,9 @@ def main():
 
     for ws in extract_workspaces(payload):
         ws_path = Path(ws)
+        if not ws_path.is_dir():
+            continue
+        record_tool_telemetry(ws_path, payload)
         if (ws_path / "AGENTS.md").exists():
             try:
                 sync_workspace(ws_path)

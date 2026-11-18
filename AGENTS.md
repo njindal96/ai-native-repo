@@ -9,7 +9,8 @@
 ## 1. Repository Overview & Zero-Dependency Contract (v3.1 Hardened)
 - **Purpose:** Reusable cross-agent plugin (`hooks.json`, `rules/`, `skills/`) + standalone scripts (`sync_context.py`, `verify_architecture.py`, `bootstrap_repo.py`, `pre_tool_hook.py`, `post_tool_hook.py`, `stop_gate_hook.py`) implementing Zero-Collateral Agentic Engineering.
 - **Zero-Dependency Rule:** All Python scripts under `scripts/` MUST use **Python 3 standard library only** (`ast`, `json`, `pathlib`, `shlex`, `tempfile`, `py_compile`, `subprocess`, `shutil`) and pass under `python3 -I` (isolated mode).
-- **Hardened Guarantees (v3.2):**
+- **Hardened Guarantees (v3.3):**
+  - **Silent Friction & Opportunity Detector (`post_tool_hook.py` + `stop_gate_hook.py`):** Passively records zero-token per-workspace tool telemetry (`READ_SEARCH_TOOLS`, `EDIT_TOOLS`, `SHELL_TOOLS`) and surfaces a 1-shot cooldown-guarded nudge at `Stop` only when one of 4 hard thresholds fires: uncaptured course-correction (rework/revert without ADR update), context thrashing (`>=8` reads before edit in an un-onboarded repo), repeated 3-step command sequences (`>=3` times), or recurring polling commands (`>=3` times).
   - **Pre-Edit Context Gate & Single-Hop Context Capsule (`--for`):** `sync_context.py` indexes `Used By` callers and `Tested By` test functions across `AGENTS.md`, and generates 1-hop Context Capsules (`python3 scripts/sync_context.py --for <file>`) bundling governing `AGENTS.md`, ADRs, blast radius, and tests. `pre_tool_hook.py` tracks reads of `AGENTS.md`/`docs/adr/*.md` and blocks blind edits to layer files once to inject the missing Context Capsule.
   - **ADR Rationale Enforcement (`check_adr_completeness`):** `verify_architecture.py` requires every `docs/adr/*.md` to contain `Context / Why` and `Decision & Invariants / Anti-Patterns` headings.
   - **Isolated Mutation & Timeouts:** `run_diff_mutation_check()` copies the workspace into a `TemporaryDirectory` (never mutating working-tree files in-place) with dynamic per-mutant timeouts (`TimeoutExpired` = killed) and configurable `max_mutants`.
@@ -27,7 +28,7 @@
 _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit inside this block._
 
 #### Scoped `AGENTS.md` Hierarchy
-- `AGENTS.md` — Scope: Repository Root (44 lines)
+- `AGENTS.md` — Scope: Repository Root (45 lines)
 - `rules/AGENTS.md` — Scope: `rules/` (14 lines)
 
 #### Active Architecture Decision Records (`docs/adr/`)
@@ -35,7 +36,7 @@ _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit
 
 #### Codebase Module & Dependency Summary
 - `scripts/bootstrap_repo.py` — Functions: `make_executable()`, `detect_code_layers()`, `detect_test_command()`, `ensure_markers_in_agents_md()`, `merge_hooks_into_settings()`, `bootstrap_repository()`, `main()` | Constants: `_SCRIPT_DIR`, `PLUGIN_SCRIPTS_DIR`, `PLUGIN_ROOT_DIR`, `ALL_CODE_EXTENSIONS`
-- `scripts/post_tool_hook.py` — Functions: `extract_workspaces()`, `main()` | Constants: `_SCRIPT_DIR`
+- `scripts/post_tool_hook.py` — Functions: `extract_workspaces()`, `get_telemetry_path()`, `load_telemetry()`, `save_telemetry()`, `extract_tool_event()`, `normalize_shell_command()`, `record_tool_telemetry()`, `evaluate_friction_opportunities()`, `main()` | Constants: `_SCRIPT_DIR`, `READ_SEARCH_TOOLS`, `EDIT_TOOLS`, `SHELL_TOOLS`, `TRIVIAL_SHELL_PREFIXES`, `POLL_SHELL_PREFIXES`
 - `scripts/pre_tool_hook.py` — Functions: `extract_command()`, `format_response()`, `split_compound_commands()`, `validate_shell_command()`, `resolve_git_target()`, `extract_file_target()`, `resolve_workspace_and_rel()`, `main()` | Constants: `_SCRIPT_DIR`, `SHELL_TOOL_NAMES`, `READ_TOOL_NAMES`, `EDIT_TOOL_NAMES`, `GIT_HOOKED_SUBCOMMANDS`, `GIT_GLOBAL_VALUE_FLAGS`, `GIT_SUBCMD_VALUE_FLAGS`, `WRAPPERS`
 - `scripts/stop_gate_hook.py` — Functions: `split_semantic_and_auto()`, `normalize_semantic_prose()`, `extract_public_contract_lines()`, `check_semantic_drift()`, `format_response()`, `extract_workspaces()`, `main()` | Constants: `_SCRIPT_DIR`
 - `scripts/sync_context.py` — Functions: `format_annotation()`, `resolve_relative_import()`, `is_internal_module()`, `parse_adr_frontmatter()`, `adr_matches_directory()`, `adr_matches_path()`, `build_reverse_index()`, `get_context_ledger_path()`, `record_context_read()`, `has_context_for_target()`, `build_context_capsule()`, `load_all_adrs()`, `inspect_python_file()`, `strip_comments_and_strings()`, `inspect_polyglot_file()`, `inspect_ts_file()`, `build_root_block()`, `build_directory_block()`, `sync_agents_file()`, `sync_workspace()`, `main()` | Constants: `START_MARKER`, `END_MARKER`, `IGNORE_DIRS`, `POLYGLOT_EXTENSIONS`

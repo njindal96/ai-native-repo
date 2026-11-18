@@ -1,6 +1,6 @@
-# `ai-native-repo` — Real-Time Context & Zero-Collateral Verification Engine (v3.2)
+# `ai-native-repo` — Real-Time Context & Zero-Collateral Verification Engine (v3.3)
 
-Turn any repository into a **self-updating, context-first, guardrail-enforced codebase** built for autonomous AI software engineers (**Antigravity**, **Claude Code**, **Cursor**, **Codex**, and **Gemini CLI**).
+Turn any repository into a **self-updating, context-first, friction-aware, guardrail-enforced codebase** built for autonomous AI software engineers (**Antigravity**, **Claude Code**, **Cursor**, **Codex**, and **Gemini CLI**).
 
 **Zero external dependencies** (pure Python 3 stdlib). **Single-hop Context Capsules (`--for`).** **Zero silent agent regressions.**
 
@@ -11,14 +11,16 @@ Turn any repository into a **self-updating, context-first, guardrail-enforced co
 Human docs and traditional unit tests break down when AI agents write code autonomously:
 1. **Agents miss the "Why":** Without knowing *why* code was built a certain way and *what alternatives were rejected*, agents propose harmful "improvements" that re-introduce domain bugs.
 2. **Agents waste turns grepping:** Without reverse dependencies (`Used By`) and test mappings (`Tested By`), agents make 5–15 exploratory calls before editing one function.
-3. **Tautological tests & reward-hacking:** Agents write weak tests, hallucinate symbols in unexecuted branches, weaken assertions, or run `git commit -n` / `--no-verify`.
+3. **Course-corrections & repeated workflows vanish in chat:** When a human corrects an agent or runs the same multi-step workflow repeatedly, the lesson or automation opportunity disappears when the session ends.
+4. **Tautological tests & reward-hacking:** Agents write weak tests, hallucinate symbols in unexecuted branches, weaken assertions, or run `git commit -n` / `--no-verify`.
 
 ### Before vs. After
 
-| Dimension | Traditional Repo | With `ai-native-repo` v3.2 |
+| Dimension | Traditional Repo | With `ai-native-repo` v3.3 |
 | :--- | :--- | :--- |
 | **Agent Onboarding & Context Time** | New agent wastes 5–15 tool calls grepping files, callers, and tests. | **Single-hop Context Capsule (`python3 scripts/sync_context.py --for <file>`)** returns governing `AGENTS.md`, full ADR `Why`/`Do Not Do`, `Used By` callers, and `Tested By` test functions in one call. |
 | **Enforcing the "Why" Before Editing** | Agent edits production files blind and breaks original domain assumptions. | **`PreToolUse` Pre-Edit Context Gate** tracks `AGENTS.md`/`docs/adr/*.md` reads and blocks blind edits once while injecting the Context Capsule inline; `check_adr_completeness()` enforces `Context / Why` & `Anti-Patterns` sections in all ADRs. |
+| **Learning From Friction (0 Tokens)** | Human corrections, exploration thrashing in un-onboarded repos, and repeated shell sequences vanish. | **Silent Friction & Opportunity Detector (`PostToolUse` + `Stop`):** Passively counts reads/reworks/workflows in `<5ms` (0 LLM tokens), stays invisible on normal turns, and emits a 1-shot cooldown-guarded nudge only when 1 of 4 hard thresholds fires (`ADR` update, `bootstrap_repo`, `Skill`, or `Automation`). |
 | **Doc Freshness & Reverse Graph** | Signatures, callers, and tests go stale immediately. | `PostToolUse` hook + `.githooks/pre-commit` re-sync `<!-- AUTO-GENERATED -->` contracts, `Used By` blast radius, and `Tested By` targets in `<50ms`. |
 | **Hallucinations & Stubs** | Unexecuted branches hide hallucinated imports, wrong dataclass fields, or `NotImplementedError` stubs. | Cross-module Python AST resolver checks imports (including relative & `__init__.py` re-exports), module aliases, and inherited `@dataclass` fields (`init=False` / `KW_ONLY` aware). |
 | **Collateral Damage & Test Tampering** | Agent deletes tests, weakens assertions, drops model fields, edits `.ai-native.json`, or bypasses hooks with `-n`. | `PreToolUse` tokenizes shell commands to block `-n`/`--no-verify`/`core.hooksPath` overrides & `chmod -x`; `verify_architecture.py` checks tests, dataclasses, `.ai-native.json`, and `.githooks/` vs `HEAD`. |
