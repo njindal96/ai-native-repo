@@ -26,26 +26,6 @@ Human docs and traditional unit tests break down when AI agents write code auton
 
 ---
 
-## The 6-Pillar Zero-Collateral Verification Architecture
-
-```mermaid
-flowchart TD
-    A["Agent Tool Call (Edit / Shell Command)"] --> B["Pillar 1: PreToolUse Gate"]
-    B -- "Uses --no-verify / fails on git push" --> C["Hard Deny / Block"]
-    B -- "Allowed" --> D["Edit / Command Executes"]
-    D --> E["Pillar 2: PostToolUse AST Sync & Symbol Resolver"]
-    E --> F["Updates AGENTS.md + Verifies Imports & Dataclass Fields"]
-    F --> G["Agent Attempts Stop or git push"]
-    G --> H["Pillar 3: Anti-Test-Tampering & Contract Diff vs HEAD"]
-    H --> I["Pillar 4: Domain Invariants & Fast Unit Tests"]
-    I --> J["Pillar 5: Diff-Scoped AST Micro-Mutation Check"]
-    J --> K["Pillar 6: Semantic Drift Gate (AGENTS.md Notes Synced?)"]
-    K -- "Any Check Fails" --> L["Block Stop / Push & Return Actionable Diagnostics"]
-    K -- "All Pass" --> M["Allow Turn Completion & Git Push"]
-```
-
----
-
 ## How to Onboard Any Repository
 
 ### Step 1: One-Time Global Plugin Install
