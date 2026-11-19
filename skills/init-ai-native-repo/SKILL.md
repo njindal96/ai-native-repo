@@ -1,9 +1,9 @@
 ---
 name: init-ai-native-repo
-description: Bootstraps or updates a repository with AI-Native v3.3 best practices: hierarchical AGENTS.md (<200 lines) with Used By & Tested By reverse maps, single-hop Context Capsules (--for), .ai-native.json pre-edit context/import/contract/mutation guardrails, rationale-enforced ADRs (docs/adr/), and the Silent Friction & Opportunity Detector.
+description: Bootstraps or updates a repository with AI-Native v3.4 best practices: hierarchical AGENTS.md (<200 lines) with Used By & Tested By reverse maps, single-hop Context Capsules (--for), .ai-native.json pre-edit context/security/import/contract/mutation/custom_gates guardrails, rationale-enforced ADRs (docs/adr/), and the Silent Friction & Opportunity Detector.
 ---
 
-# Initialize AI-Native Repository (v3.3)
+# Initialize AI-Native Repository (v3.4)
 
 Use this skill when bootstrapping or upgrading any Python or Polyglot (TS/JS/Go/Rust/Java) repository designed for autonomous AI coding agents.
 
@@ -21,7 +21,7 @@ Use this skill when bootstrapping or upgrading any Python or Polyglot (TS/JS/Go/
    - `.githooks/pre-commit` + `.githooks/pre-push` (`git config core.hooksPath .githooks`, chaining `.local` hooks)
 
 2. **Customize Domain Boundaries, Invariants & ADRs:**
-   - **`.ai-native.json`**: Tighten `allowed_internal_prefixes`, `forbidden_imports`, optional `max_layers_touched`, and optional `poll_command_prefixes`, and set `test_command`.
+   - **`.ai-native.json`**: Tighten `allowed_internal_prefixes`, `forbidden_imports`, optional `max_layers_touched`, optional `poll_command_prefixes`, and optional `custom_gates` (e.g., `ruff`, `bandit`, `npm audit`, `gosec`), and set `test_command`. Use `# ai-native-ignore: <reason>` only for intentional, audited SAST exceptions.
    - **Root & Scoped `AGENTS.md`** (<200 lines each): Document system overview, schema/API invariants, and `Always / Ask First / Never` action tiers. Fetch any file's single-hop capsule anytime via `python3 scripts/sync_context.py --for <target_file>`.
    - **`docs/adr/NNN-slug.md`**: Add machine-readable ADRs with YAML frontmatter (`id`, `title`, `status`, `applies_to`, `summary`) plus explicit `## Context & Why`, `## Decision & Invariants`, and `## Anti-Patterns / Do Not Do` headings.
    - **Domain Invariants & Golden Tests**: Add `validate_invariants()` checks on core models and fixture regression tests under `tests/`.
@@ -30,4 +30,4 @@ Use this skill when bootstrapping or upgrading any Python or Polyglot (TS/JS/Go/
    ```bash
    python3 scripts/sync_context.py && python3 scripts/verify_architecture.py
    ```
-   Confirm all `<!-- AUTO-GENERATED -->` blocks are populated (`Used By` / `Tested By` included) and all v3.3 checks pass. Global plugin hooks automatically keep onboarded repo scripts up to date and surface silent friction/opportunity nudges when course-corrections or repeated workflows occur.
+   Confirm all `<!-- AUTO-GENERATED -->` blocks are populated (`Used By` / `Tested By` included) and all v3.4 checks (SAST, timeouts, import cycles, contract regressions, AST mutations, and `custom_gates`) pass. Global plugin hooks automatically keep onboarded repo scripts up to date and surface silent friction/opportunity nudges when course-corrections or repeated workflows occur.

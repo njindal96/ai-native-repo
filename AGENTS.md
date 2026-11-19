@@ -32,7 +32,7 @@ _Updated automatically from source code & ADRs by `sync_context.py`. Do not edit
 
 #### Scoped `AGENTS.md` Hierarchy
 - `AGENTS.md` — Scope: Repository Root (48 lines)
-- `rules/AGENTS.md` — Scope: `rules/` (16 lines)
+- `rules/AGENTS.md` — Scope: `rules/` (19 lines)
 
 #### Active Architecture Decision Records (`docs/adr/`)
 - **`ADR-001`** (`docs/adr/001-six-pillar-zero-collateral-verification.md`) — **Six-Pillar Zero-Collateral Verification Harness** [Applies to: `*`] — Enforce PreToolUse hook-bypass blocking, cross-module AST symbol resolution, anti-test-tampering & contract compatibility checks vs HEAD, domain invariants, diff-scoped AST micro-mutation testing, and semantic drift gating using Python stdlib only.
