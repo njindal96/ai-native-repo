@@ -373,6 +373,7 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             "test_command": detect_test_command(repo_root),
             "enforce_contract_compatibility": True,
             "enforce_pre_edit_context": True,
+            "enforce_security_checks": True,
             "mutation_testing": True,
             "max_mutants": 25,
             "layers": layers,
@@ -386,6 +387,9 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             changed_cfg = False
             if "enforce_pre_edit_context" not in cfg:
                 cfg["enforce_pre_edit_context"] = True
+                changed_cfg = True
+            if "enforce_security_checks" not in cfg:
+                cfg["enforce_security_checks"] = True
                 changed_cfg = True
             if "max_mutants" not in cfg:
                 cfg["max_mutants"] = 25

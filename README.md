@@ -23,6 +23,7 @@ Human docs and traditional unit tests break down when AI agents write code auton
 | **Learning From Friction (0 Tokens)** | Human corrections, exploration thrashing in un-onboarded repos, and repeated shell sequences vanish. | **Silent Friction & Opportunity Detector (`PostToolUse` + `Stop`):** Passively counts reads/reworks/workflows in `<5ms` (0 LLM tokens), stays invisible on normal turns, and emits a 1-shot cooldown-guarded nudge only when 1 of 4 hard thresholds fires (`ADR` update, `bootstrap_repo`, `Skill`, or `Automation`). |
 | **Doc Freshness & Reverse Graph** | Signatures, callers, and tests go stale immediately. | `PostToolUse` hook + `.githooks/pre-commit` re-sync `<!-- AUTO-GENERATED -->` contracts, `Used By` blast radius, and `Tested By` targets in `<50ms`. |
 | **Hallucinations & Stubs** | Unexecuted branches hide hallucinated imports, wrong dataclass fields, or `NotImplementedError` stubs. | Cross-module Python AST resolver checks imports (including relative & `__init__.py` re-exports), module aliases, and inherited `@dataclass` fields (`init=False` / `KW_ONLY` aware). |
+| **Security, Cycles & Custom Gates** | Agents introduce hardcoded tokens, `eval()`, SQL interpolation, missing HTTP timeouts, or circular imports. | **Zero-dependency SAST & Cycle Guard** catches secrets, unsafe deserialization/sinks, `verify=False`, missing `requests` timeouts, and circular imports (`# ai-native-ignore` opt-out); `.ai-native.json` supports pluggable `custom_gates` (`bandit`, `semgrep`, `ruff`, `npm audit`, `gosec`). |
 | **Collateral Damage & Test Tampering** | Agent deletes tests, weakens assertions, drops model fields, edits `.ai-native.json`, or bypasses hooks with `-n`. | `PreToolUse` tokenizes shell commands to block `-n`/`--no-verify`/`core.hooksPath` overrides & `chmod -x`; `verify_architecture.py` checks tests, dataclasses, `.ai-native.json`, and `.githooks/` vs `HEAD`. |
 | **Weak / Tautological Tests** | Agent writes trivial tests that pass even if logic is broken. | **Isolated tempdir diff-scoped AST micro-mutation testing** tests changed Python branches with per-mutant timeout (zero working-tree corruption). |
 | **Architectural Memory & Handoffs** | Next agent undoes hidden invariants or leaves without documenting changes. | Machine-readable ADRs (`docs/adr/*.md`) route into matching `AGENTS.md` files, and `Stop` gate blocks semantic drift (whitespace-bypass resistant). |
@@ -124,9 +125,13 @@ python3 scripts/sync_context.py --for app/services/billing.py
      "test_command": "python3 -m unittest discover -s tests -p 'test_*.py'",
      "enforce_contract_compatibility": true,
      "enforce_pre_edit_context": true,
+     "enforce_security_checks": true,
      "mutation_testing": true,
      "max_mutants": 25,
      "max_layers_touched": 3,
+     "custom_gates": [
+       { "name": "ruff", "command": "ruff check .", "timeout": 30 }
+     ],
      "layers": [
        {
          "path": "app/domain",

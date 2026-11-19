@@ -34,7 +34,10 @@ from sync_context import (  # noqa: E402
 from verify_architecture import (  # noqa: E402
     check_adr_completeness,
     check_git_head_regressions,
+    check_import_cycles,
+    check_security_and_reliability,
     check_symbol_and_dataclass_resolution,
+    run_custom_gates,
     run_diff_mutation_check,
     verify_workspace,
 )
@@ -1147,6 +1150,139 @@ class TestAiNativeEngine(unittest.TestCase):
             res = _run_hook_inproc(stop_gate_hook, {"cwd": str(tmp_path), "terminationReason": "NO_TOOL_CALL"})
             self.assertEqual(res["decision"], "continue")
             self.assertIn("Automation Candidate", res["reason"])
+
+    def test_v34_security_reliability_sast_and_ignore_hatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            app_dir = tmp_path / "app"
+            app_dir.mkdir()
+            (app_dir / "__init__.py").write_text("", encoding="utf-8")
+
+            aws_tok = "AKIA" + "IOSFODNN7EXAMPLE12"[:16]
+            priv_hdr = "-----BEGIN " + "RSA PRIVATE KEY-----"
+            db_secret_uri = "postgresql://admin:" + "SuperSecret99@db.internal:5432/prod"
+            db_placeholder = "postgresql://${DB_USER}:" + "localpass@example.com:5432/db"
+
+            # Unsafe Python file hitting all AST security & timeout checks + expanded secrets
+            (app_dir / "unsafe.py").write_text(
+                f'AWS_ID = "{aws_tok}"\n'
+                f'KEY = "{priv_hdr}"\n'
+                f'DB = "{db_secret_uri}"\n'
+                "import pickle, subprocess, yaml, requests\n\n"
+                "def bad(user_in, cmd, uid):\n"
+                "    eval(user_in)\n"
+                "    pickle.loads(user_in)\n"
+                "    yaml.load(user_in)\n"
+                "    subprocess.run(cmd, shell=True)\n"
+                "    cursor.execute(f'SELECT * FROM users WHERE id = {uid}')\n"
+                "    requests.get('https://example.org', verify=False)\n"
+                "    requests.post('https://example.org')\n",
+                encoding="utf-8",
+            )
+
+            # Safe Python file + suppressed eval via ai-native-ignore + dict.get() no false positive
+            (app_dir / "safe.py").write_text(
+                f'TEMPLATE = "{db_placeholder}"\n'
+                "import yaml, requests\n\n"
+                "def ok(cfg: dict, stream):\n"
+                "    val = cfg.get('key')\n"
+                "    data = yaml.load(stream, Loader=yaml.SafeLoader)\n"
+                "    r = requests.get('https://example.org', timeout=10)\n"
+                "    cursor.execute('SELECT * FROM users WHERE id = %s', (1,))\n"
+                "    x = eval('1 + 1')  # ai-native-ignore: constant math\n"
+                "    return val, data, r, x\n",
+                encoding="utf-8",
+            )
+
+            # Polyglot unsafe patterns + comment suppression
+            (app_dir / "client.tsx").write_text(
+                "// eval(ignoredComment)\n"
+                "export function View() { return <div dangerouslySetInnerHTML={{ __html: raw }} />; }\n"
+                "const opts = { rejectUnauthorized: false };\n"
+                "const okIgnored = eval('2'); // ai-native-ignore: intentional\n",
+                encoding="utf-8",
+            )
+            (app_dir / "tls.go").write_text(
+                "package main\n"
+                "var cfg = Config{InsecureSkipVerify: true}\n",
+                encoding="utf-8",
+            )
+
+            errs = check_security_and_reliability(tmp_path, {"enforce_security_checks": True})
+            joined = "\n".join(errs)
+            self.assertIn("app/unsafe.py:1", joined)
+            self.assertIn("app/unsafe.py:2", joined)
+            self.assertIn("app/unsafe.py:3", joined)
+            self.assertIn("eval()", joined)
+            self.assertIn("pickle.loads()", joined)
+            self.assertIn("yaml.load()", joined)
+            self.assertIn("shell=True", joined)
+            self.assertIn("SQL `execute()`", joined)
+            self.assertIn("verify=False", joined)
+            self.assertIn("requests.post()` without an explicit `timeout=`", joined)
+            self.assertIn("app/client.tsx:2", joined)
+            self.assertIn("dangerouslySetInnerHTML", joined)
+            self.assertIn("rejectUnauthorized: false", joined)
+            self.assertIn("app/tls.go:2", joined)
+            self.assertIn("InsecureSkipVerify: true", joined)
+            self.assertNotIn("app/safe.py", joined)
+            self.assertNotIn("app/client.tsx:1", joined)
+            self.assertNotIn("app/client.tsx:4", joined)
+
+            # Disabled toggle returns empty
+            self.assertEqual(check_security_and_reliability(tmp_path, {"enforce_security_checks": False}), [])
+
+    def test_v34_circular_import_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            app_dir = tmp_path / "app"
+            app_dir.mkdir()
+            (app_dir / "__init__.py").write_text("", encoding="utf-8")
+            (app_dir / "a.py").write_text("from app import b\n", encoding="utf-8")
+            (app_dir / "b.py").write_text("from app import c\n", encoding="utf-8")
+            (app_dir / "c.py").write_text("from app import a\n", encoding="utf-8")
+
+            cycles = check_import_cycles(tmp_path)
+            self.assertEqual(len(cycles), 1)
+            self.assertIn("app.a -> app.b -> app.c -> app.a", cycles[0])
+
+            (app_dir / "c.py").write_text("VALUE = 1\n", encoding="utf-8")
+            self.assertEqual(check_import_cycles(tmp_path), [])
+
+    def test_v34_custom_gates_and_security_tamper_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            pass_cfg = {"custom_gates": [{"name": "ok-gate", "command": f"{sys.executable} -c 'print(1)'"}]}
+            self.assertEqual(run_custom_gates(tmp_path, pass_cfg), [])
+
+            fail_cfg = {"custom_gates": [{"name": "fail-gate", "command": f"{sys.executable} -c 'import sys; sys.exit(2)'"}]}
+            gate_errs = run_custom_gates(tmp_path, fail_cfg)
+            self.assertEqual(len(gate_errs), 1)
+            self.assertIn("[Custom Gate Failed: fail-gate]", gate_errs[0])
+
+            # Commit strict config with custom_gates, then attempt weakening
+            strict_cfg = json.loads((tmp_path / ".ai-native.json").read_text(encoding="utf-8"))
+            strict_cfg["enforce_security_checks"] = True
+            strict_cfg["enforce_pre_edit_context"] = True
+            strict_cfg["custom_gates"] = [{"name": "sec-gate", "command": f"{sys.executable} -c 'pass'"}]
+            (tmp_path / ".ai-native.json").write_text(json.dumps(strict_cfg, indent=2), encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "strict"], cwd=str(tmp_path), check=True, capture_output=True)
+
+            weak_cfg = dict(strict_cfg)
+            weak_cfg["enforce_security_checks"] = False
+            weak_cfg["enforce_pre_edit_context"] = False
+            weak_cfg["custom_gates"] = []
+            (tmp_path / ".ai-native.json").write_text(json.dumps(weak_cfg, indent=2), encoding="utf-8")
+
+            tamper_errs = "\n".join(check_git_head_regressions(tmp_path, weak_cfg))
+            self.assertIn("enforce_security_checks", tamper_errs)
+            self.assertIn("enforce_pre_edit_context", tamper_errs)
+            self.assertIn("custom_gates", tamper_errs)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Deterministic AI-Native Repository Verifier (v3.1 — Zero-Collateral Verification Engine)
+Deterministic AI-Native Repository Verifier (v3.4 — Zero-Collateral Verification Engine)
 Enforces:
 1. Python syntax compilation, LLM smells (bare except: pass, unimplemented stubs), and secret checks
 2. Cross-module AST symbol, module-alias & inherited @dataclass field resolution (anti-hallucination)
-3. Declarative layer import boundaries from .ai-native.json (Python + TS/JS/Go/Rust/Java lexical imports)
-4. Anti-test-tampering, public dataclass contract regression, .ai-native.json/.githooks tampering & blast-radius checks vs HEAD
-5. Progressive disclosure context budgets on all AGENTS.md files
-6. Fast deterministic unit tests (test_command) with baseline timing
-7. Isolated tempdir diff-scoped AST micro-mutation testing with per-mutant timeout & configurable max_mutants
+3. High-precision Security & Reliability SAST (secrets, unsafe sinks, SQLi, verify=False, HTTP timeouts)
+4. Declarative layer import boundaries & internal circular-import detection (Python + Tier-2 Polyglot)
+5. Anti-test-tampering, public dataclass contract regression, .ai-native.json/.githooks tampering & blast-radius checks vs HEAD
+6. Progressive disclosure context budgets & ADR rationale completeness on AGENTS.md / docs/adr/*.md
+7. Fast deterministic unit tests (test_command), pluggable custom_gates & isolated diff-scoped AST micro-mutations
 """
 from __future__ import annotations
 
@@ -35,8 +35,30 @@ POLYGLOT_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".go", ".rs", ".jav
 NON_FIELD_BASE_NAMES = {"object", "ABC", "Generic", "Protocol"}
 
 SECRET_PATTERNS = [
-    re.compile(r"\b(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z\-_]{35})\b")
+    re.compile(r"\b(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z\-_]{35})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:xox[baprs]-[0-9A-Za-z\-]{10,}|sk_live_[0-9A-Za-z]{20,})\b"),
+    re.compile(r"-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----"),
+    re.compile(r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^/\s:@\"']+:[^/\s@\"']{4,}@[^\s\"']+"),
 ]
+
+SECRET_PLACEHOLDERS = ("${", "<", "user:pass@", "example.com")
+
+
+def _find_secret_issues(lines: list[str], rel_path: str) -> list[str]:
+    issues: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if "ai-native-ignore" in line:
+            continue
+        for pat in SECRET_PATTERNS:
+            m = pat.search(line)
+            if m:
+                matched = m.group(0).lower()
+                if any(ph in matched for ph in SECRET_PLACEHOLDERS):
+                    continue
+                issues.append(f"[Secret Leak Risk] {rel_path}:{idx} matches a hardcoded token or credential pattern.")
+                break
+    return issues
 
 
 def resolve_import_module(rel_path: str, module: Optional[str], level: int) -> str:
@@ -136,19 +158,20 @@ def extract_imports(py_path: Path, workspace_root: Optional[Path] = None) -> lis
             for alias in node.names:
                 imports.append(alias.name)
         elif isinstance(node, ast.ImportFrom):
+            resolved = ""
             if node.level > 0 and rel_path:
                 resolved = resolve_import_module(rel_path, node.module, node.level)
-                if resolved:
-                    imports.append(resolved)
-                    if node.module is None and workspace_root is not None:
-                        base_dir = workspace_root.joinpath(*resolved.split("."))
-                        for alias in node.names:
-                            if alias.name != "*" and (
-                                (base_dir / alias.name).is_dir() or (base_dir / f"{alias.name}.py").is_file()
-                            ):
-                                imports.append(f"{resolved}.{alias.name}")
             elif node.module:
-                imports.append(node.module)
+                resolved = node.module
+            if resolved:
+                imports.append(resolved)
+                if workspace_root is not None:
+                    base_dir = workspace_root.joinpath(*resolved.split("."))
+                    for alias in node.names:
+                        if alias.name != "*" and (
+                            (base_dir / alias.name).is_dir() or (base_dir / f"{alias.name}.py").is_file()
+                        ):
+                            imports.append(f"{resolved}.{alias.name}")
     return imports
 
 
@@ -201,10 +224,7 @@ def check_llm_smells(py_path: Path, rel_path: str) -> list[str]:
                     )
 
     if not is_test_or_verifier:
-        for idx, line in enumerate(source.splitlines(), start=1):
-            for pat in SECRET_PATTERNS:
-                if pat.search(line):
-                    issues.append(f"[Secret Leak Risk] {rel_path}:{idx} matches a hardcoded token pattern.")
+        issues.extend(_find_secret_issues(source.splitlines(), rel_path))
     return issues
 
 
@@ -608,6 +628,29 @@ def _check_config_and_hooks_tampering(workspace_root: Path, new_cfg: dict) -> li
                     issues.append(
                         "[Guardrail Tampering Blocked] `.ai-native.json` weakened `enforce_contract_compatibility` from true to false."
                     )
+                if old_cfg.get("enforce_security_checks", True) and not new_cfg.get("enforce_security_checks", True):
+                    issues.append(
+                        "[Guardrail Tampering Blocked] `.ai-native.json` weakened `enforce_security_checks` from true to false."
+                    )
+                if old_cfg.get("enforce_pre_edit_context", True) and not new_cfg.get("enforce_pre_edit_context", True):
+                    issues.append(
+                        "[Guardrail Tampering Blocked] `.ai-native.json` weakened `enforce_pre_edit_context` from true to false."
+                    )
+                old_gates = {
+                    str(g.get("name") or g.get("command"))
+                    for g in old_cfg.get("custom_gates", [])
+                    if isinstance(g, dict) and (g.get("name") or g.get("command"))
+                }
+                new_gates = {
+                    str(g.get("name") or g.get("command"))
+                    for g in new_cfg.get("custom_gates", [])
+                    if isinstance(g, dict) and (g.get("name") or g.get("command"))
+                }
+                removed_gates = sorted(old_gates - new_gates)
+                if removed_gates:
+                    issues.append(
+                        f"[Guardrail Tampering Blocked] `.ai-native.json` removed custom_gates {removed_gates}."
+                    )
                 old_budget = old_cfg.get("context_budget", {})
                 new_budget = new_cfg.get("context_budget", {})
                 if int(new_budget.get("max_lines", 200)) > int(old_budget.get("max_lines", 200)):
@@ -954,6 +997,266 @@ def check_adr_completeness(workspace_root: Path) -> list[str]:
     return issues
 
 
+def _collect_constant_strings(node: ast.AST) -> str:
+    return " ".join(
+        sub.value for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+    )
+
+
+def _is_test_rel_path(rel_path: str) -> bool:
+    norm = rel_path.lstrip("./")
+    name = Path(norm).name
+    return (
+        norm.startswith("tests/")
+        or norm.startswith("test/")
+        or "/__tests__/" in f"/{norm}"
+        or name.startswith("test_")
+        or name.endswith((
+            ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
+            ".test.js", ".spec.js", ".test.jsx", ".spec.jsx",
+            "_test.go", "_test.rs", "Test.java", "Tests.java",
+        ))
+    )
+
+
+def check_security_and_reliability(workspace_root: Path, config: dict) -> list[str]:
+    """
+    Zero-dependency high-precision Security & Reliability SAST across Python AST and Tier-2 Polyglot sources.
+    Supports inline suppression via `# ai-native-ignore` / `// ai-native-ignore`.
+    """
+    if not config.get("enforce_security_checks", True):
+        return []
+
+    issues: list[str] = []
+    http_methods = {"get", "post", "put", "patch", "delete", "head", "request"}
+    sql_verbs = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER)\b", re.I)
+
+    for py_file in sorted(workspace_root.rglob("*.py")):
+        if any(part in IGNORE_DIRS for part in py_file.relative_to(workspace_root).parts):
+            continue
+        rel = py_file.relative_to(workspace_root).as_posix()
+        if _is_test_rel_path(rel) or rel == "scripts/verify_architecture.py":
+            continue
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            lines = source.splitlines()
+            issues.extend(_find_secret_issues(lines, rel))
+            tree = ast.parse(source, filename=str(py_file))
+        except Exception:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lineno = getattr(node, "lineno", 0)
+            if 1 <= lineno <= len(lines) and "ai-native-ignore" in lines[lineno - 1]:
+                continue
+
+            if isinstance(node.func, ast.Name):
+                fn = node.func.id
+                obj = ""
+            elif isinstance(node.func, ast.Attribute):
+                fn = node.func.attr
+                obj = _attr_or_name(node.func.value)
+            else:
+                continue
+
+            if not obj and fn in {"eval", "exec"}:
+                issues.append(f"[Security Risk] {rel}:{lineno} calls dangerous built-in `{fn}()`.")
+
+            if obj in {"pickle", "_pickle"} and fn in {"load", "loads"}:
+                issues.append(f"[Security Risk] {rel}:{lineno} calls insecure deserialization `{obj}.{fn}()`.")
+
+            if obj == "yaml" and fn == "load":
+                loader_val = None
+                for kw in node.keywords:
+                    if kw.arg == "Loader":
+                        loader_val = _attr_or_name(kw.value)
+                        break
+                if loader_val is None and len(node.args) >= 2:
+                    loader_val = _attr_or_name(node.args[1])
+                loader_tail = loader_val.split(".")[-1] if loader_val else ""
+                if loader_tail not in {"SafeLoader", "CSafeLoader", "BaseLoader"}:
+                    issues.append(
+                        f"[Security Risk] {rel}:{lineno} calls `yaml.load()` without SafeLoader/CSafeLoader/BaseLoader."
+                    )
+
+            if obj == "subprocess" and fn in {"run", "Popen", "call", "check_call", "check_output"}:
+                has_shell_true = any(
+                    kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                    for kw in node.keywords
+                )
+                if has_shell_true:
+                    cmd_arg = node.args[0] if node.args else next(
+                        (kw.value for kw in node.keywords if kw.arg == "args"),
+                        None,
+                    )
+                    if cmd_arg is not None and not (isinstance(cmd_arg, ast.Constant) and isinstance(cmd_arg.value, str)):
+                        issues.append(
+                            f"[Security Risk] {rel}:{lineno} invokes `subprocess.{fn}(..., shell=True)` with a dynamic command."
+                        )
+
+            if obj and fn in {"execute", "executemany"} and node.args:
+                first_arg = node.args[0]
+                is_interp = (
+                    isinstance(first_arg, ast.JoinedStr)
+                    or (isinstance(first_arg, ast.BinOp) and isinstance(first_arg.op, (ast.Add, ast.Mod)))
+                    or (
+                        isinstance(first_arg, ast.Call)
+                        and isinstance(first_arg.func, ast.Attribute)
+                        and first_arg.func.attr == "format"
+                    )
+                )
+                if is_interp and sql_verbs.search(_collect_constant_strings(first_arg)):
+                    issues.append(
+                        f"[Security Risk] {rel}:{lineno} uses string interpolation inside SQL `{fn}()`."
+                    )
+
+            if fn in http_methods:
+                if any(
+                    kw.arg == "verify" and isinstance(kw.value, ast.Constant) and kw.value.value is False
+                    for kw in node.keywords
+                ):
+                    issues.append(f"[Security Risk] {rel}:{lineno} disables TLS certificate verification (`verify=False`).")
+                if obj in {"requests", "httpx"}:
+                    if not any(kw.arg in {"timeout", None} for kw in node.keywords):
+                        issues.append(
+                            f"[Reliability Risk] {rel}:{lineno} calls `{obj}.{fn}()` without an explicit `timeout=` argument."
+                        )
+
+    # Tier-2 Polyglot Security Checks (comment-stripped lines)
+    ts_sinks = (
+        (re.compile(r"\beval\s*\("), "eval()"),
+        (re.compile(r"\bnew\s+Function\s*\("), "new Function()"),
+        (re.compile(r"\bdangerouslySetInnerHTML\b"), "dangerouslySetInnerHTML"),
+        (re.compile(r"\.innerHTML\s*="), ".innerHTML assignment"),
+        (re.compile(r"\brejectUnauthorized\s*:\s*false\b"), "rejectUnauthorized: false"),
+    )
+    go_sinks = (
+        (re.compile(r"\bInsecureSkipVerify\s*:\s*true\b"), "InsecureSkipVerify: true"),
+    )
+    for pf in sorted(workspace_root.rglob("*")):
+        if (
+            not pf.is_file()
+            or pf.suffix.lower() not in POLYGLOT_EXTENSIONS
+            or any(part in IGNORE_DIRS for part in pf.relative_to(workspace_root).parts)
+        ):
+            continue
+        rel = pf.relative_to(workspace_root).as_posix()
+        if _is_test_rel_path(rel):
+            continue
+        try:
+            raw = pf.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        orig_lines = raw.splitlines()
+        issues.extend(_find_secret_issues(orig_lines, rel))
+        stripped_lines = _strip_comments_keep_strings(raw).splitlines()
+        suffix = pf.suffix.lower()
+        sinks = ts_sinks if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs"} else (go_sinks if suffix == ".go" else ())
+        if not sinks:
+            continue
+        for idx, line in enumerate(stripped_lines, start=1):
+            if idx <= len(orig_lines) and "ai-native-ignore" in orig_lines[idx - 1]:
+                continue
+            for pat, label in sinks:
+                if pat.search(line):
+                    issues.append(f"[Security Risk] {rel}:{idx} uses unsafe pattern `{label}`.")
+                    break
+
+    return issues
+
+
+def check_import_cycles(workspace_root: Path) -> list[str]:
+    """Detect circular internal Python module imports via canonical 3-color DFS."""
+    graph: dict[str, set[str]] = {}
+    py_entries: list[tuple[str, str, Path]] = []
+
+    for pf in sorted(workspace_root.rglob("*.py")):
+        if any(part in IGNORE_DIRS for part in pf.relative_to(workspace_root).parts):
+            continue
+        rel = pf.relative_to(workspace_root).as_posix()
+        if _is_test_rel_path(rel) or rel.startswith("scripts/") or pf.name == "__init__.py":
+            continue
+        mod_name = ".".join(pf.relative_to(workspace_root).with_suffix("").parts)
+        if mod_name:
+            py_entries.append((rel, mod_name, pf))
+            graph[mod_name] = set()
+
+    valid_mods = set(graph)
+    for _, mod_name, pf in py_entries:
+        try:
+            imps = extract_imports(pf, workspace_root=workspace_root)
+        except Exception:
+            continue
+        for imp in imps:
+            if imp in valid_mods and imp != mod_name:
+                graph[mod_name].add(imp)
+
+    color: dict[str, int] = {}
+    path: list[str] = []
+    seen_cycles: set[tuple[str, ...]] = set()
+    issues: list[str] = []
+
+    def _dfs(node: str) -> None:
+        color[node] = 1
+        path.append(node)
+        for nxt in sorted(graph.get(node, ())):
+            state = color.get(nxt, 0)
+            if state == 0:
+                _dfs(nxt)
+            elif state == 1 and nxt in path:
+                idx = path.index(nxt)
+                cycle = path[idx:]
+                min_i = min(range(len(cycle)), key=lambda i: cycle[i])
+                canon = tuple(cycle[min_i:] + cycle[:min_i])
+                if canon not in seen_cycles:
+                    seen_cycles.add(canon)
+                    issues.append(
+                        f"[Circular Import] Detected internal module cycle: {' -> '.join(list(canon) + [canon[0]])}."
+                    )
+        path.pop()
+        color[node] = 2
+
+    for mod_name in sorted(valid_mods):
+        if color.get(mod_name, 0) == 0:
+            _dfs(mod_name)
+
+    return issues
+
+
+def run_custom_gates(workspace_root: Path, config: dict) -> list[str]:
+    """Run optional pluggable security/lint commands configured under `.ai-native.json` `custom_gates`."""
+    issues: list[str] = []
+    gates = config.get("custom_gates")
+    if not isinstance(gates, list):
+        return issues
+    for idx, gate in enumerate(gates):
+        if not isinstance(gate, dict):
+            continue
+        name = str(gate.get("name") or f"custom_gate_{idx + 1}")
+        cmd = str(gate.get("command") or "").strip()
+        if not cmd:
+            continue
+        timeout_val = float(gate.get("timeout", 60))
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=str(workspace_root),
+                capture_output=True,
+                text=True,
+                timeout=timeout_val,
+            )
+            if proc.returncode != 0:
+                out = (proc.stdout + "\n" + proc.stderr).strip()[-1000:]
+                issues.append(f"[Custom Gate Failed: {name}] `{cmd}` exited with {proc.returncode}:\n{out}")
+        except subprocess.TimeoutExpired:
+            issues.append(f"[Custom Gate Failed: {name}] `{cmd}` timed out after {timeout_val}s.")
+    return issues
+
+
 def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate: bool = False) -> list[str]:
     errors: list[str] = []
     config_path = workspace_root / ".ai-native.json"
@@ -979,8 +1282,11 @@ def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate:
     if errors:
         return errors
 
-    # 2. Cross-Module AST Symbol & Dataclass Field Resolution
+    # 2. Cross-Module AST Symbol & Dataclass Field Resolution, Security/Reliability SAST & Cycle Detection
     errors.extend(check_symbol_and_dataclass_resolution(workspace_root))
+    errors.extend(check_security_and_reliability(workspace_root, config))
+    errors.extend(check_import_cycles(workspace_root))
+    errors = list(dict.fromkeys(errors))
 
     # 3. Layer Import Boundary Check (Python AST + Tier 2 Polyglot Lexical Imports)
     layers = config.get("layers", [])
@@ -1051,7 +1357,7 @@ def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate:
                 f"(cap: {max_lines} lines / {max_bytes} bytes). Move deep runbooks into .agents/skills/ or docs/adr/."
             )
 
-    # 6. Fast Deterministic Unit Tests
+    # 6. Fast Deterministic Unit Tests & Pluggable Custom Gates
     test_cmd = config.get("test_command")
     baseline_duration = 0.0
     if run_tests and test_cmd:
@@ -1067,6 +1373,9 @@ def verify_workspace(workspace_root: Path, run_tests: bool = True, force_mutate:
         if proc.returncode != 0:
             out = (proc.stdout + "\n" + proc.stderr).strip()[-1000:]
             errors.append(f"[Unit Test Failure] `{test_cmd}` failed:\n{out}")
+
+    if run_tests:
+        errors.extend(run_custom_gates(workspace_root, config))
 
     # 7. Isolated Diff-Scoped AST Micro-Mutation Testing
     if not errors and run_tests and test_cmd and (force_mutate or config.get("mutation_testing", False)):

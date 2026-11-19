@@ -14,8 +14,8 @@ Use this skill when bootstrapping or upgrading any Python or Polyglot (TS/JS/Go/
    python3 ~/.gemini/config/plugins/ai-native-repo/scripts/bootstrap_repo.py --workspace .
    ```
    This automatically creates or non-destructively upgrades:
-   - `scripts/sync_context.py` (`Used By`, `Tested By`, `--for <file>` Context Capsules) and `scripts/verify_architecture.py` (`check_adr_completeness()`, AST boundaries, isolated diff-scoped mutations)
-   - `.ai-native.json` (with `enforce_contract_compatibility`, `enforce_pre_edit_context`, `mutation_testing`, `max_mutants`, `context_budget`, `test_command`, and auto-detected `layers`)
+   - `scripts/sync_context.py` (`Used By`, `Tested By`, `--for <file>` Context Capsules) and `scripts/verify_architecture.py` (`check_adr_completeness()`, AST boundaries, `check_security_and_reliability()`, `check_import_cycles()`, `custom_gates`, isolated diff-scoped mutations)
+   - `.ai-native.json` (with `enforce_contract_compatibility`, `enforce_pre_edit_context`, `enforce_security_checks`, `mutation_testing`, `max_mutants`, `context_budget`, `test_command`, and auto-detected `layers`)
    - Root `AGENTS.md` + `CLAUDE.md` symlink + scoped `*/AGENTS.md` files with `<!-- AUTO-GENERATED -->` markers
    - Starter `docs/adr/001-ai-native-architecture.md` (with required `Context & Why`, `Decision & Invariants`, and `Anti-Patterns / Do Not Do` sections)
    - `.githooks/pre-commit` + `.githooks/pre-push` (`git config core.hooksPath .githooks`, chaining `.local` hooks)
