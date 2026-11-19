@@ -1168,32 +1168,11 @@ def check_security_and_reliability(workspace_root: Path, config: dict) -> list[s
     return issues
 
 
-def check_import_cycles(workspace_root: Path) -> list[str]:
-    """Detect circular internal Python module imports via canonical 3-color DFS."""
-    graph: dict[str, set[str]] = {}
-    py_entries: list[tuple[str, str, Path]] = []
+TS_CYCLE_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs"}
 
-    for pf in sorted(workspace_root.rglob("*.py")):
-        if any(part in IGNORE_DIRS for part in pf.relative_to(workspace_root).parts):
-            continue
-        rel = pf.relative_to(workspace_root).as_posix()
-        if _is_test_rel_path(rel) or rel.startswith("scripts/") or pf.name == "__init__.py":
-            continue
-        mod_name = ".".join(pf.relative_to(workspace_root).with_suffix("").parts)
-        if mod_name:
-            py_entries.append((rel, mod_name, pf))
-            graph[mod_name] = set()
 
-    valid_mods = set(graph)
-    for _, mod_name, pf in py_entries:
-        try:
-            imps = extract_imports(pf, workspace_root=workspace_root)
-        except Exception:
-            continue
-        for imp in imps:
-            if imp in valid_mods and imp != mod_name:
-                graph[mod_name].add(imp)
-
+def _find_graph_cycles(graph: dict[str, set[str]]) -> list[str]:
+    """Detect canonical cycles in a directed dependency graph via 3-color DFS."""
     color: dict[str, int] = {}
     path: list[str] = []
     seen_cycles: set[tuple[str, ...]] = set()
@@ -1219,9 +1198,148 @@ def check_import_cycles(workspace_root: Path) -> list[str]:
         path.pop()
         color[node] = 2
 
-    for mod_name in sorted(valid_mods):
+    for mod_name in sorted(graph):
         if color.get(mod_name, 0) == 0:
             _dfs(mod_name)
+
+    return issues
+
+
+def _extract_runtime_ts_imports(file_path: Path) -> list[str]:
+    """Extract runtime TS/JS module specifiers, ignoring comments and type-only imports."""
+    try:
+        cleaned = _strip_comments_keep_strings(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    cleaned = re.sub(
+        r"\b(?:import|export)\s+type\b[^;\"']*?\bfrom\s+[\"'][^\"']+[\"']\s*;?",
+        " ",
+        cleaned,
+    )
+
+    def _strip_all_type_braces(m: re.Match) -> str:
+        items = [part.strip() for part in m.group(1).split(",") if part.strip()]
+        if items and all(re.match(r"^type\s+", item) for item in items):
+            return " "
+        return m.group(0)
+
+    cleaned = re.sub(
+        r"\b(?:import|export)\s*\{([^}]*)\}\s*from\s*[\"'][^\"']+[\"']\s*;?",
+        _strip_all_type_braces,
+        cleaned,
+    )
+    specs: list[str] = []
+    for pat in (
+        r"""\bfrom\s+["']([^"']+)["']""",
+        r"""(?:^|[;\n])\s*import\s+["']([^"']+)["']""",
+        r"""\brequire\(\s*["']([^"']+)["']\s*\)""",
+        r"""\bimport\(\s*["']([^"']+)["']\s*\)""",
+    ):
+        specs.extend(re.findall(pat, cleaned))
+    return specs
+
+
+def _resolve_ts_spec(
+    src_file: Path,
+    spec: str,
+    workspace_root: Path,
+    ts_rel_set: set[str],
+    tsconfig_dir: Optional[Path],
+) -> Optional[str]:
+    base: Optional[Path] = None
+    if spec.startswith("."):
+        base = src_file.parent / spec
+    elif spec.startswith("@/"):
+        root_dir = tsconfig_dir or workspace_root
+        sub = spec[2:]
+        cand_src = root_dir / "src" / sub
+        base = cand_src if (root_dir / "src").is_dir() else (root_dir / sub)
+    if base is None:
+        return None
+    try:
+        res_base = base.resolve()
+        res_root = workspace_root.resolve()
+        rel_base = res_base.relative_to(res_root).as_posix()
+    except Exception:
+        return None
+
+    candidates = [rel_base]
+    for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs"):
+        candidates.append(f"{rel_base}{ext}")
+    for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs"):
+        candidates.append(f"{rel_base}/index{ext}")
+    for cand in candidates:
+        if cand in ts_rel_set:
+            return cand
+    return None
+
+
+def _find_nearest_tsconfig_dir(src_file: Path, workspace_root: Path) -> Optional[Path]:
+    res_root = workspace_root.resolve()
+    cur = src_file.parent.resolve()
+    while True:
+        if (cur / "tsconfig.json").is_file() or (cur / "jsconfig.json").is_file():
+            return cur
+        if cur == res_root or cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def check_import_cycles(workspace_root: Path) -> list[str]:
+    """Detect circular internal Python and Tier-2 TS/JS module imports via canonical 3-color DFS."""
+    py_graph: dict[str, set[str]] = {}
+    py_entries: list[tuple[str, str, Path]] = []
+
+    for pf in sorted(workspace_root.rglob("*.py")):
+        if any(part in IGNORE_DIRS for part in pf.relative_to(workspace_root).parts):
+            continue
+        rel = pf.relative_to(workspace_root).as_posix()
+        if _is_test_rel_path(rel) or rel.startswith("scripts/") or pf.name == "__init__.py":
+            continue
+        mod_name = ".".join(pf.relative_to(workspace_root).with_suffix("").parts)
+        if mod_name:
+            py_entries.append((rel, mod_name, pf))
+            py_graph[mod_name] = set()
+
+    valid_mods = set(py_graph)
+    for _, mod_name, pf in py_entries:
+        try:
+            imps = extract_imports(pf, workspace_root=workspace_root)
+        except Exception:
+            continue
+        for imp in imps:
+            if imp in valid_mods and imp != mod_name:
+                py_graph[mod_name].add(imp)
+
+    issues = _find_graph_cycles(py_graph)
+
+    ts_entries: list[tuple[str, Path]] = []
+    for tf in sorted(workspace_root.rglob("*")):
+        if not tf.is_file() or tf.suffix.lower() not in TS_CYCLE_EXTENSIONS or tf.name.endswith(".d.ts"):
+            continue
+        rel_parts = tf.relative_to(workspace_root).parts
+        if any(part in IGNORE_DIRS for part in rel_parts):
+            continue
+        rel = tf.relative_to(workspace_root).as_posix()
+        if _is_test_rel_path(rel) or rel.endswith("config.ts") or rel.endswith("config.mjs"):
+            continue
+        ts_entries.append((rel, tf))
+
+    if ts_entries:
+        ts_rel_set = {rel for rel, _ in ts_entries}
+        ts_graph: dict[str, set[str]] = {rel: set() for rel, _ in ts_entries}
+        tsconfig_cache: dict[Path, Optional[Path]] = {}
+        for rel, tf in ts_entries:
+            parent = tf.parent
+            if parent not in tsconfig_cache:
+                tsconfig_cache[parent] = _find_nearest_tsconfig_dir(tf, workspace_root)
+            tc_dir = tsconfig_cache[parent]
+            for spec in _extract_runtime_ts_imports(tf):
+                target_rel = _resolve_ts_spec(tf, spec, workspace_root, ts_rel_set, tc_dir)
+                if target_rel and target_rel != rel:
+                    ts_graph[rel].add(target_rel)
+        issues.extend(_find_graph_cycles(ts_graph))
 
     return issues
 

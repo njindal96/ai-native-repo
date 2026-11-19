@@ -54,19 +54,40 @@ def _has_source_files(directory: Path) -> bool:
     return False
 
 
+NON_LAYER_SUBDIRS = IGNORE_DIRS | {"tests", "test", "__tests__", "scripts", "docs", "public", "assets"}
+STACK_MANIFEST_NAMES = (
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+)
+
+
 def detect_code_layers(repo_root: Path) -> list[dict]:
     layers = []
     candidates = []
-    skip_top = IGNORE_DIRS | {"scripts", "tests", "docs", ".github", "skills", "rules", "assets"}
+    skip_top = IGNORE_DIRS | {"scripts", "tests", "test", "docs", ".github", "skills", "rules", "assets", "public"}
     for child in sorted(repo_root.iterdir()):
         if not child.is_dir() or child.name in skip_top:
             continue
         subdirs = [
             d for d in sorted(child.iterdir())
-            if d.is_dir() and d.name not in IGNORE_DIRS and _has_source_files(d)
+            if d.is_dir() and d.name not in NON_LAYER_SUBDIRS and _has_source_files(d)
         ]
         if subdirs:
-            candidates.extend(subdirs)
+            for sub in subdirs:
+                if sub.name == "src":
+                    src_subs = [
+                        sd for sd in sorted(sub.iterdir())
+                        if sd.is_dir() and sd.name not in NON_LAYER_SUBDIRS and _has_source_files(sd)
+                    ]
+                    candidates.extend(src_subs if src_subs else [sub])
+                else:
+                    candidates.append(sub)
         elif _has_source_files(child):
             candidates.append(child)
 
@@ -190,7 +211,7 @@ def _install_git_hooks_non_destructive(repo_root: Path) -> list[str]:
             [
                 "python3 scripts/sync_context.py",
                 "python3 scripts/verify_architecture.py",
-                "git add AGENTS.md */AGENTS.md **/AGENTS.md 2>/dev/null || true",
+                "find . -name AGENTS.md -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.next/*' -exec git add {} + 2>/dev/null || true",
             ],
         ),
         (
@@ -397,6 +418,24 @@ def bootstrap_repository(repo_root: Path) -> list[str]:
             if changed_cfg:
                 config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
                 actions.append("Upgraded .ai-native.json defaults")
+            configured_tops = {
+                str(layer.get("path") or "").strip().strip("/").split("/")[0]
+                for layer in (layers or [])
+                if isinstance(layer, dict) and layer.get("path")
+            }
+            unregistered_stacks = [
+                child.name
+                for child in sorted(repo_root.iterdir())
+                if child.is_dir()
+                and child.name not in IGNORE_DIRS
+                and child.name not in configured_tops
+                and any((child / mf).is_file() for mf in STACK_MANIFEST_NAMES)
+            ]
+            if unregistered_stacks:
+                actions.append(
+                    "Detected unregistered sub-project(s) missing .ai-native.json layers: "
+                    + ", ".join(unregistered_stacks)
+                )
         except Exception:
             pass
 

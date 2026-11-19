@@ -23,7 +23,38 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from sync_context import adr_matches_path, load_all_adrs, sync_workspace  # noqa: E402
+from sync_context import (  # noqa: E402
+    IGNORE_DIRS,
+    POLYGLOT_EXTENSIONS,
+    adr_matches_path,
+    load_all_adrs,
+    sync_workspace,
+)
+
+SOURCE_CODE_EXTENSIONS = {".py"} | POLYGLOT_EXTENSIONS
+STACK_MANIFEST_FILES = (
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+)
+NON_STACK_TOP_DIRS = {
+    "tests",
+    "test",
+    "scripts",
+    "docs",
+    ".github",
+    ".githooks",
+    ".agents",
+    "skills",
+    "rules",
+    "assets",
+    "public",
+}
 
 READ_SEARCH_TOOLS = {
     "read_file",
@@ -136,6 +167,8 @@ def _default_telemetry(now: float) -> dict:
         "first_edit_done": False,
         "adr_or_agents_edited": False,
         "layer_file_edits": {},
+        "unregistered_stack_edits": {},
+        "oversized_file_edits": {},
         "shell_history": [],
         "command_ngrams": {},
         "poll_commands": {},
@@ -240,7 +273,43 @@ def _to_rel_path(ws_path: Path, file_target: str) -> str:
     return p.as_posix().lstrip("./")
 
 
-def _is_layer_source(ws_path: Path, rel_path: str) -> bool:
+def _load_ai_native_config(ws_path: Path) -> Optional[dict]:
+    cfg_path = ws_path / ".ai-native.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _is_non_test_code_source(rel_path: str) -> bool:
+    if not rel_path:
+        return False
+    norm = Path(rel_path).as_posix().lstrip("./")
+    p = Path(norm)
+    name = p.name
+    if name in {"AGENTS.md", "CLAUDE.md", ".ai-native.json"} or norm.endswith(".d.ts"):
+        return False
+    if norm.endswith(("config.ts", "config.mjs", "config.js")):
+        return False
+    if p.suffix.lower() not in SOURCE_CODE_EXTENSIONS:
+        return False
+    if any(norm.startswith(prefix) for prefix in ("docs/", "tests/", "test/", "scripts/", ".githooks/")):
+        return False
+    if "/tests/" in f"/{norm}" or "/test/" in f"/{norm}" or "/__tests__/" in f"/{norm}":
+        return False
+    if name.startswith("test_") or name.endswith((
+        ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
+        ".test.js", ".spec.js", ".test.jsx", ".spec.jsx",
+        "_test.go", "_test.rs", "Test.java", "Tests.java",
+    )):
+        return False
+    return True
+
+
+def _is_layer_source(ws_path: Path, rel_path: str, cfg: Optional[dict] = None) -> bool:
     if not rel_path:
         return False
     norm = Path(rel_path).as_posix().lstrip("./")
@@ -248,17 +317,32 @@ def _is_layer_source(ws_path: Path, rel_path: str) -> bool:
         return False
     if any(norm.startswith(prefix) for prefix in ("docs/", "tests/", "scripts/", ".githooks/")):
         return False
-    cfg_path = ws_path / ".ai-native.json"
-    if not cfg_path.is_file():
+    loaded = cfg if cfg is not None else _load_ai_native_config(ws_path)
+    if loaded is None:
         return False
-    try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    for layer in cfg.get("layers", []):
+    for layer in loaded.get("layers", []):
         lp = str(layer.get("path") or "").strip().strip("/")
         if lp and (norm == lp or norm.startswith(lp + "/")):
             return True
+    return False
+
+
+def _has_dir_stack_manifest_or_sources(dir_path: Path) -> bool:
+    if not dir_path.is_dir():
+        return False
+    for mf in STACK_MANIFEST_FILES:
+        if (dir_path / mf).is_file():
+            return True
+    src_count = 0
+    for item in dir_path.rglob("*"):
+        if not item.is_file() or item.name.endswith(".d.ts"):
+            continue
+        if any(part in IGNORE_DIRS for part in item.relative_to(dir_path).parts):
+            continue
+        if item.suffix.lower() in SOURCE_CODE_EXTENSIONS:
+            src_count += 1
+            if src_count >= 3:
+                return True
     return False
 
 
@@ -279,9 +363,10 @@ def record_tool_telemetry(ws_path: Path, payload: object) -> None:
         state["first_edit_done"] = True
         rel_path = _to_rel_path(ws_path, file_target)
         if rel_path:
+            cfg = _load_ai_native_config(ws_path)
             if Path(rel_path).name in {"AGENTS.md", "CLAUDE.md"} or rel_path.startswith("docs/adr/"):
                 state["adr_or_agents_edited"] = True
-            elif _is_layer_source(ws_path, rel_path):
+            elif _is_layer_source(ws_path, rel_path, cfg):
                 entry = state["layer_file_edits"].setdefault(
                     rel_path,
                     {"edit_count": 0, "rework_cycles": 0, "reverted": False},
@@ -292,6 +377,28 @@ def record_tool_telemetry(ws_path: Path, payload: object) -> None:
                     or state.get("last_edited_file") != rel_path
                 ):
                     entry["rework_cycles"] = int(entry.get("rework_cycles", 0)) + 1
+            elif cfg is not None and _is_non_test_code_source(rel_path):
+                parts = Path(Path(rel_path).as_posix().lstrip("./")).parts
+                if len(parts) >= 2:
+                    top_dir = parts[0]
+                    if top_dir not in NON_STACK_TOP_DIRS and top_dir not in IGNORE_DIRS:
+                        state["unregistered_stack_edits"][top_dir] = (
+                            int(state["unregistered_stack_edits"].get(top_dir, 0)) + 1
+                        )
+
+            if cfg is not None and _is_non_test_code_source(rel_path):
+                target_file = ws_path / Path(rel_path).as_posix().lstrip("./")
+                threshold = int((cfg.get("context_budget") or {}).get("max_source_file_lines", 800))
+                if target_file.is_file():
+                    try:
+                        line_cnt = len(target_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+                        if line_cnt >= threshold:
+                            state["oversized_file_edits"][rel_path] = line_cnt
+                        else:
+                            state["oversized_file_edits"].pop(rel_path, None)
+                    except OSError:
+                        pass
+
             state["last_edited_file"] = rel_path
         state["last_tool_category"] = "edit"
         save_telemetry(ws_path, state)
@@ -342,13 +449,14 @@ def _has_adr_git_changes(ws_path: Path) -> bool:
 
 def evaluate_friction_opportunities(ws_path: Path) -> Optional[str]:
     """
-    Evaluate 4 deterministic friction & opportunity thresholds at turn completion.
+    Evaluate 6 deterministic friction & opportunity thresholds at turn completion.
     Fires at most 1 nudge per turn (recording its cooldown key so it never nags twice).
     """
     state = load_telemetry(ws_path)
     state["last_tool_category"] = "stop"
     cooldowns: dict = state["cooldowns_fired"]
     now = time.time()
+    cfg = _load_ai_native_config(ws_path)
 
     # Rule 1: Uncaptured Course-Correction (rework or revert in a layer file without ADR update)
     if (ws_path / ".ai-native.json").is_file() and not state["adr_or_agents_edited"] and not _has_adr_git_changes(ws_path):
@@ -409,6 +517,53 @@ def evaluate_friction_opportunities(ws_path: Path) -> Optional[str]:
                 f"The status/polling command `{cmd_str}` ran {count} times. "
                 "Append a 1-line offer at the end of your reply to turn it into a `/schedule` cron or GitHub Actions automation."
             )
+
+    # Rule 5: Unregistered sub-project / new stack edited without .ai-native.json layers
+    if cfg is not None:
+        configured_prefixes = [
+            str(layer.get("path") or "").strip().strip("/")
+            for layer in cfg.get("layers", [])
+            if isinstance(layer, dict) and layer.get("path")
+        ]
+        for top_dir in sorted(state["unregistered_stack_edits"]):
+            cd_key = f"new_stack:{top_dir}"
+            if cd_key in cooldowns:
+                continue
+            already_registered = any(
+                lp == top_dir or lp.startswith(top_dir + "/") for lp in configured_prefixes
+            )
+            if not already_registered and _has_dir_stack_manifest_or_sources(ws_path / top_dir):
+                cooldowns[cd_key] = now
+                save_telemetry(ws_path, state)
+                return (
+                    f"[ai-native-repo Opportunity Detector — Unregistered Sub-Project `{top_dir}/`] "
+                    f"Code under `{top_dir}/` is not yet registered in `.ai-native.json` layers. "
+                    f"Before finishing (or in 1 line at the end of your reply), register `{top_dir}/` layers and `custom_gates` in `.ai-native.json`, "
+                    f"add `{top_dir}/AGENTS.md` + a matching `docs/adr/*.md` (`applies_to: {top_dir}/*`), and add unit tests (`Tested By`)."
+                )
+
+    # Rule 6: Oversized source file (>= context_budget.max_source_file_lines, default 800)
+    if cfg is not None:
+        threshold = int((cfg.get("context_budget") or {}).get("max_source_file_lines", 800))
+        for rel_path in sorted(state["oversized_file_edits"]):
+            cd_key = f"monolith:{rel_path}"
+            if cd_key in cooldowns:
+                continue
+            target_file = ws_path / Path(rel_path).as_posix().lstrip("./")
+            if not target_file.is_file():
+                continue
+            try:
+                current_lines = len(target_file.read_text(encoding="utf-8", errors="ignore").splitlines())
+            except OSError:
+                continue
+            if current_lines >= threshold:
+                cooldowns[cd_key] = now
+                save_telemetry(ws_path, state)
+                return (
+                    f"[ai-native-repo Opportunity Detector — Oversized Source File] "
+                    f"`{rel_path}` is {current_lines} lines (threshold: {threshold}), increasing agent context cost and edit blast radius. "
+                    "Before finishing (or in 1 line at the end of your reply), consider splitting it into focused sub-modules (~200-400 lines)."
+                )
 
     save_telemetry(ws_path, state)
     return None

@@ -18,7 +18,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 import post_tool_hook  # noqa: E402
 import pre_tool_hook  # noqa: E402
 import stop_gate_hook  # noqa: E402
-from bootstrap_repo import bootstrap_repository, detect_test_command, merge_hooks_into_settings  # noqa: E402
+from bootstrap_repo import (  # noqa: E402
+    bootstrap_repository,
+    detect_code_layers,
+    detect_test_command,
+    merge_hooks_into_settings,
+)
 from pre_tool_hook import extract_command, validate_shell_command  # noqa: E402
 from stop_gate_hook import check_semantic_drift, split_semantic_and_auto  # noqa: E402
 from sync_context import (  # noqa: E402
@@ -1283,6 +1288,95 @@ class TestAiNativeEngine(unittest.TestCase):
             self.assertIn("enforce_security_checks", tamper_errs)
             self.assertIn("enforce_pre_edit_context", tamper_errs)
             self.assertIn("custom_gates", tamper_errs)
+
+    def test_v35_polyglot_dts_excluded_and_ts_cycle_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            web_dir = tmp_path / "web"
+            src_dir = web_dir / "src"
+            lib_dir = src_dir / "lib"
+            lib_dir.mkdir(parents=True)
+            (web_dir / "tsconfig.json").write_text("{}", encoding="utf-8")
+            (web_dir / "next-env.d.ts").write_text('/// <reference types="next" />\n', encoding="utf-8")
+            (web_dir / "AGENTS.md").write_text(
+                f"# Web\n\n{START_MARKER}\n{END_MARKER}\n",
+                encoding="utf-8",
+            )
+            (lib_dir / "a.ts").write_text(
+                'import { helperB } from "./b";\nexport function helperA() { return helperB(); }\n',
+                encoding="utf-8",
+            )
+            (lib_dir / "b.ts").write_text(
+                'import { helperA } from "@/lib/a";\nexport function helperB() { return helperA(); }\n',
+                encoding="utf-8",
+            )
+
+            sync_workspace(tmp_path)
+            web_agents = (web_dir / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertNotIn("next-env.d.ts", web_agents)
+            self.assertIn("web/src/lib/a.ts", web_agents)
+
+            cycles = check_import_cycles(tmp_path)
+            self.assertEqual(len(cycles), 1)
+            self.assertIn("web/src/lib/a.ts -> web/src/lib/b.ts -> web/src/lib/a.ts", cycles[0])
+
+            # Type-only import breaks runtime cycle -> zero cycle errors
+            (lib_dir / "b.ts").write_text(
+                'import type { SomeType } from "./a";\n'
+                'import { type AnotherType } from "@/lib/a";\n'
+                "export function helperB() { return 1; }\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_import_cycles(tmp_path), [])
+
+    def test_v35_unregistered_stack_and_monolith_friction_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _init_git_repo(tmp_path)
+            _create_sample_app(tmp_path)
+            bootstrap_repository(tmp_path)
+
+            web_src = tmp_path / "web" / "src" / "lib"
+            web_src.mkdir(parents=True)
+            (tmp_path / "web" / "package.json").write_text('{"name": "web"}\n', encoding="utf-8")
+            monolith = web_src / "util.ts"
+            monolith.write_text("\n".join(f"export const c{i} = {i};" for i in range(820)) + "\n", encoding="utf-8")
+
+            _run_hook_inproc(
+                post_tool_hook,
+                {
+                    "cwd": str(tmp_path),
+                    "tool_name": "write_file",
+                    "tool_input": {"file_path": str(monolith)},
+                },
+            )
+            nudge1 = post_tool_hook.evaluate_friction_opportunities(tmp_path)
+            self.assertIsNotNone(nudge1)
+            self.assertIn("Unregistered Sub-Project `web/`", nudge1)
+
+            # Next evaluation (with web/ cooldown spent) surfaces oversized source file Rule 6
+            nudge2 = post_tool_hook.evaluate_friction_opportunities(tmp_path)
+            self.assertIsNotNone(nudge2)
+            self.assertIn("Oversized Source File", nudge2)
+            self.assertIn("web/src/lib/util.ts", nudge2)
+
+            # Both cooldowns spent -> no repeat nags
+            self.assertIsNone(post_tool_hook.evaluate_friction_opportunities(tmp_path))
+
+    def test_v35_bootstrap_detects_subproject_src_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "web" / "src" / "lib").mkdir(parents=True)
+            (tmp_path / "web" / "src" / "components").mkdir(parents=True)
+            (tmp_path / "web" / "tests").mkdir(parents=True)
+            (tmp_path / "web" / "src" / "lib" / "a.ts").write_text("export const x = 1;\n", encoding="utf-8")
+            (tmp_path / "web" / "src" / "components" / "C.tsx").write_text("export const C = () => null;\n", encoding="utf-8")
+            (tmp_path / "web" / "tests" / "a.test.ts").write_text("import '../src/lib/a';\n", encoding="utf-8")
+
+            detected_paths = [entry["path"] for entry in detect_code_layers(tmp_path)]
+            self.assertIn("web/src/lib", detected_paths)
+            self.assertIn("web/src/components", detected_paths)
+            self.assertNotIn("web/tests", detected_paths)
 
 
 if __name__ == "__main__":

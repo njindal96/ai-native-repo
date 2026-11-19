@@ -836,6 +836,7 @@ def _iter_polyglot_files(dir_path: Path) -> list[Path]:
         p for p in dir_path.rglob("*")
         if p.is_file()
         and p.suffix.lower() in POLYGLOT_EXTENSIONS
+        and not p.name.endswith(".d.ts")
         and not any(part in IGNORE_DIRS for part in p.relative_to(dir_path).parts)
     )
 

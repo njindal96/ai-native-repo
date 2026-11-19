@@ -1,4 +1,4 @@
-# AI-Native Repository Protocol (v3.4)
+# AI-Native Repository Protocol (v3.5)
 
 When operating as a software engineering agent in any repository with `AGENTS.md`:
 
@@ -14,6 +14,7 @@ When operating as a software engineering agent in any repository with `AGENTS.md
 3. **Closed-Loop Verification & Semantic Sync:**
    - Run `python3 scripts/verify_architecture.py` after edits to validate syntax, cross-module symbol resolution, security/reliability SAST (`check_security_and_reliability()`), circular imports (`check_import_cycles()`), layer boundaries, contract compatibility, unit tests, pluggable `custom_gates`, and diff-scoped mutation coverage.
    - Whenever your changes alter the auto-generated public contract (adding/removing/changing classes, dataclasses, functions, or modules), you MUST also update the semantic section of the corresponding `AGENTS.md` (and add/update a `docs/adr/*.md` if an architectural invariant changed) before finishing your turn.
+   - Whenever you introduce a new stack or sub-project directory (e.g., `web/`, `mobile/`, `services/`), register its layers and `custom_gates` in `.ai-native.json`, add a scoped `AGENTS.md` and `docs/adr/*.md` (`applies_to`), add unit tests (`Tested By`), and keep source modules focused (`< ~800` lines).
 4. **Universal Multi-Repo Scalability & Compatibility (When Editing Plugin / Shared Infrastructure):**
    - Any enhancement to shared AI-native tooling/hooks must be repository- and stack-agnostic, non-destructively upgrade previously onboarded repositories, and preserve backward compatibility with older `.ai-native.json`, ADR schemas, and all 5 agent hook payload formats.
    - Keep forced pre-commit/stop gates deterministic with near-zero false positives (no subjective style or premature micro-optimization blockers).
